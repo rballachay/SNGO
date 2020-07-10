@@ -1,8 +1,7 @@
 using JuMP, Ipopt, DataFrames
 push!(LOAD_PATH, ENV["SINGODIR"])
-include("/SNGO/PlasmoOld/src/PlasmoOld.jl")
 # using SCIP
-using .PlasmoOld, Ipopt
+using Ipopt
 using JuMP
 using MAT
 include("../bb.jl")
@@ -57,6 +56,10 @@ end
 
 lt0 = length(time0)
 function createMonoPiece(j::Int, t, piece, npiece)
+    global r
+    global a
+    global yc
+
     m = Model()
     @variable(m, lowerBoundR1<=r[j]<=upperBoundR1)
     @variable(m, lbMat[j,j]<=a[j,j]<=ubMat[j,j])
@@ -92,9 +95,9 @@ function createMonoPiece(j::Int, t, piece, npiece)
     ind_start = round(Int, t[1]/0.5)
 
     if ind_start == 0
-        @constraint(m, objective>=10000*(sum{(y[numOfDisc*(i-1)]-data[j].abundance[1][i+ind_start])^2, i=1:(length(t))}))
+        @constraint(m, objective>=10000*(sum((y[numOfDisc*(i-1)]-data[j].abundance[1][i+ind_start])^2 for i in 1:(length(t)))))
     else
-	@constraint(m, objective>=10000*(sum{(y[numOfDisc*(i-1)]-data[j].abundance[1][i+ind_start])^2, i=2:(length(t))}))
+	@constraint(m, objective>=10000*(sum((y[numOfDisc*(i-1)]-data[j].abundance[1][i+ind_start])^2 for i in 2:(length(t)))))
     end
     @objective(m, Min, objective)
     return m
@@ -123,15 +126,15 @@ for i = 1:npiece
            node = createMonoPiece(j, t, i, npiece)
            # add first-stage variables and constraints
            @addNode(m, node, "s$i")
-           @constraint(m, getvariable(node, :r)[j]==r[j])
-           @constraint(m, getvariable(node, :a)[j,j]==a[j,j])
+           @constraint(m, getindex(node, :r)[j]==r[j])
+           @constraint(m, getindex(node, :a)[j,j]==a[j,j])
            if i == 1
-               @constraint(m, getvariable(node, :yc)[i]==yc[i])
+               @constraint(m, getindex(node, :yc)[i]==yc[i])
            elseif i == npiece
-               @constraint(m, getvariable(node, :yc)[i-1]==yc[i-1])
+               @constraint(m, getindex(node, :yc)[i-1]==yc[i-1])
            else
-               @constraint(m, getvariable(node, :yc)[i-1]==yc[i-1])
-               @constraint(m, getvariable(node, :yc)[i]==yc[i])
+               @constraint(m, getindex(node, :yc)[i-1]==yc[i-1])
+               @constraint(m, getindex(node, :yc)[i]==yc[i])
            end
 end
 

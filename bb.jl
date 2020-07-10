@@ -1,86 +1,46 @@
 push!(LOAD_PATH, pwd())
-using Gurobi, Plasmo
-using MathProgBase.SolverInterface
-using JuMP, Ipopt, Printf, MathProgBase
-#JuMP.EnableNLPResolve()
+using Gurobi, JuMP, Ipopt, SCIP, PlasmoOld,Printf,MathProgBase
+import MathProgBase.SolverInterface
+using Distributions
 include("core.jl")
 
-function hasBinaryVar(m)
-    for i = 1:m.numCols
-        if m.colCat[i] == :Bin
-            return true
-    end
-    end
-    return false
-end
 
-function copyGraph(mg::OptiGraph)
-    new_graph = OptiGraph()
-    for node in getnodes(mg)
-        new_node,ref_map = copy(node)   #creates new _models.  Use ref map to reference old graph variables
-        add_node!(new_graph,new_node)
-    end
-            
-    #for linkedge in getedges(mg)
-      # new_edge,ref_map = copy(linkedge)
-     #   add_edge!(new_graph,new_edge)
-    #end
-    return new_graph
-end
-
-function num_constraints(model::Model)
-    OStgCons = 0
-    OStgVars = 0
-    for (name, value) in object_dictionary(model)
-        refString = string(typeof(value))
-        if occursin("Constraint", refString)
-            OStgCons+=1
-        end
-        if occursin("Variable", refString)
-            OStgVars+=1
-        end
-    end
-    println(OStgCons)
-    println(OStgVars)
-
-    return OStgCons
-end
-
-function branch_bound(m)  
+function branch_bound(m)
     time_ns()
     #Ipopt_solve(m)
-    P = copyGraph(m)
-    scenarios = P.modelnodes[2:end]
+    P = copyStoModel(m)
+    scenarios = PlasmoOld.getchildren(P)
     global nscen = length(scenarios)
     global nfirst = num_variables(P)
-    println("No. of first stage variables  ", num_variables(P.modelnodes[1]))
+    println("No. of first stage variables  ", num_variables(P))
     println("No. of second stage variables ", num_variables(scenarios[1]))
-    #println("No. of second stage constraints ", scenarios[1].NumberOfConstraints{F,S}())
+    #println("No. of second stage constraints ", MathProgBase.numconstr(scenarios[1]))
     println("No. of scenarios  ", length(scenarios))
-    Pcount,ref_map = combine(m)
+    Pcount = extensiveSimplifiedModel(P)
     global hasBin = hasBinaryVar(Pcount)
     println("No. of total variables ", num_variables(Pcount))
-    #println("No. of total constraints ", num_constraints(Pcount))
+    #println("No. of total constraints ", MathProgBase.numconstr(Pcount))
     println("No. of binary variables ", numBinaryVar(Pcount))
-    println("No. of continuous variables ", num_variables(Pcount) - numBinaryVar(Pcount))
+    println("No. of continuous variables ", Pcount.numCols-numBinaryVar(Pcount))
+    Pcount = 1
 
     relax_LB_time_total = 0
     global_LB_time_total = 0
     local_UB_time_total = 0
     global_UB_time_total = 0
     BT_time_total = 0
-    VS_time_total = 0    
+    VS_time_total = 0
 
 
 
 #### get initial UB #########################################
     UB = 1e10
-    Pex_local,ref = combine(m)
+    Pex_local = extensiveSimplifiedModel(P)
     if hasBin
         fixBinaryVar(Pex_local)
     end
-    Pex_local.ext[:solver] = IpoptSolver(print_level = 0, max_cpu_time = 600.0)
-    time_ns()
+    Pex_local.solver = IpoptSolver(print_level = 0, max_cpu_time = 600.0)
+    tic()
     UB, local_status = multi_start!(Pex_local, UB)
     ### To do, store the whole solution
     if local_status == :Optimal
@@ -92,7 +52,7 @@ function branch_bound(m)
 
     # solve with Ipopt_Solve
     if local_status != :Optimal
-        P_local = PlasmoOld.copyStoModel(P)
+        P_local = copyStoModel(P)
         if hasBin
             fixBinaryVar(P_local)
         end
@@ -105,58 +65,58 @@ function branch_bound(m)
                 updateStoSolFromSto!(P_local, P)
             end
         end
-	P_local = nothing
+    P_local = nothing
     end
-    local_UB_time_total += time_ns()
+    local_UB_time_total += toq()
     println("U:   ", UB)
 
 ####  preprocess master-children form ##############################################
     if debug
-        time_ns()
+        tic()
     end
     pr_children = preprocessSto!(P)
     if debug
-        println("preprocess:   ",  time_ns(), " (s)")
+        println("preprocess:   ",  toq(), " (s)")
     end
 
 
 ##### create and solve extensive form after preprocess #######################################################
-    time_ns()
-    Pex = PlasmoOld.extensiveSimplifiedModel(P)
-    Pex_probing = PlasmoOld.copyModel(Pex)
-    println("extensive:   ",  time_ns(), " (s)")
+    tic()
+    Pex = extensiveSimplifiedModel(P)
+    Pex_probing = copyModel(Pex)
+    println("extensive:   ",  toq(), " (s)")
     #println(Pex)
 
-    time_ns()
+    tic()
     prex = preprocessex!(Pex)
-    println("preprocessex:   ",  time_ns(), " (s)")
+    println("preprocessex:   ",  toq(), " (s)")
 
     if hasBin
-        Pex_local = PlasmoOld.copyModel(Pex)
+        Pex_local = copyModel(Pex)
         fixBinaryVar(Pex_local)
-	Pex_local.solver = IpoptSolver(max_cpu_time = 600.0)
-	local_status = solve(Pex_local)
-	if local_status == :Optimal && UB > Pex.objVal
+    Pex_local.solver = IpoptSolver(max_cpu_time = 600.0)
+    local_status = solve(Pex_local)
+    if local_status == :Optimal && UB > Pex.objVal
             Pex.colVal = copy(Pex_local.colVal)
             Pex.objVal = Pex_local.objVal
-	    UB = Pex.objVal
-	    updateStoSolFromExtensive!(Pex, P)
+        UB = Pex.objVal
+        updateStoSolFromExtensive!(Pex, P)
         end
     else
         Pex.solver = IpoptSolver(max_cpu_time = 600.0)
-    	local_status = solve(Pex)
-    	if local_status == :Optimal && UB > Pex.objVal
-	    UB = Pex.objVal
+        local_status = solve(Pex)
+        if local_status == :Optimal && UB > Pex.objVal
+        UB = Pex.objVal
             updateStoSolFromExtensive!(Pex, P)
-	end    
+    end
     end
     println("U:   ", UB)
 
 
     # check if P is feasible
-    time_ns()
+    tic()
     feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, nothing, UB)
-    BT_time_total += time_ns()
+    BT_time_total += toq()
     if !feasible
        println("infeasible")
        if UB > 0
@@ -164,7 +124,7 @@ function branch_bound(m)
        else
             LB = min(UB-mingap, UB*(1+mingap))
        end
-       println("Solution time:   ",  time_ns(), " (s)")
+       println("Solution time:   ",  toq(), " (s)")
        println("solved nodes:  ",1)
        println("relax_LB_time_total:   ", relax_LB_time_total, " (s)")
        println("global_LB_time_total:   ", global_LB_time_total, " (s)")
@@ -179,13 +139,13 @@ function branch_bound(m)
 
 ##### create relaxed problem of extensive form ################################################
     if debug
-        time_ns()
+        tic()
     end
     R=relax(Pex, prex, 1e10)   #UB)
-    Roriginal = PlasmoOld.copyModel(R)
-    Rold = PlasmoOld.copyModel(Roriginal)
+    Roriginal = copyModel(R)
+    Rold = copyModel(Roriginal)
     if debug
-        println("relax:   ",  time_ns(), " (s)")
+        println("relax:   ",  toq(), " (s)")
     end
 
 
@@ -194,16 +154,16 @@ function branch_bound(m)
     vs = VarSelector(bVarsId)
 
     # P might be in the QP form
-    Pprobing = PlasmoOld.copyStoModel(P)
-    P_child = PlasmoOld.copyStoModel(P)
-    PWS = PlasmoOld.copyStoModel(P)         # P is used for get upper bound from local solver, PWS is used for get lower bound from wait and see solution, PWS is nonlinear form
-    PWSfix = PlasmoOld.copyStoModel(PWS)    # PWSfix is used for get upper bound from wait and see solution with first stage fixed, PWSfixed is nonlinear form
+    Pprobing = copyStoModel(P)
+    P_child = copyStoModel(P)
+    PWS = copyStoModel(P)         # P is used for get upper bound from local solver, PWS is used for get lower bound from wait and see solution, PWS is nonlinear form
+    PWSfix = copyStoModel(PWS)    # PWSfix is used for get upper bound from wait and see solution with first stage fixed, PWSfixed is nonlinear form
     #PWS = copyNLStoModel(P)        # P is used for get upper bound from local solver, PWS is used for get lower bound from wait and see solution, PWS is nonlinear form
     #PWSfix = copyNLStoModel(PWS)    # PWSfix is used for get upper bound from wait and see solution with first stage fixed, PWSfixed is nonlinear form
     scenariosWS = PlasmoOld.getchildren(PWS)
     scenariosWSfix = PlasmoOld.getchildren(PWSfix)
-    PWS_child = PlasmoOld.copyStoModel(PWS)
-    Pex_child = PlasmoOld.copyModel(Pex)
+    PWS_child = copyStoModel(PWS)
+    Pex_child = copyModel(Pex)
 
 
     root = Node(copy(Pex.colLower), copy(Pex.colUpper), -1, 1, -1e10, 0, nothing, nothing, 1e10, Symbol[])
@@ -223,17 +183,17 @@ function branch_bound(m)
     println(" iter ", " left ", " lev  ", " bVarId ","      bvlb      ", "       bvub      ", "       LB       ", "       UB      ", "      gap   ")
 
     LB = -1e10
-    FLB = UB			#lower bound for the fathoned node( with lb <= ub but (ub-lb)<=mingap)
+    FLB = UB            #lower bound for the fathoned node( with lb <= ub but (ub-lb)<=mingap)
     LB_UB_list = []
 
 
 #####inside main loop##################################
-    while nodeList!=[]    	 
-	if iter == 5000
-	   break
-	end
+    while nodeList!=[]
+    if iter == 5000
+       break
+    end
         iter += 1
-	push!(LB_UB_list, [LB, UB, 1, 1])
+    push!(LB_UB_list, [LB, UB, 1, 1])
         if (iter != 1)
             LB_UB_list[iter-1][1] = LB
             LB_UB_list[iter-1][2] = UB
@@ -244,79 +204,79 @@ function branch_bound(m)
         end
 
         ############find the node with the lowest lower bound############
-	LB, nodeid = getGlobalLowerBound(nodeList, FLB, UB)
+    LB, nodeid = getGlobalLowerBound(nodeList, FLB, UB)
 
         #############copy information from node to Pex and P############
         node = nodeList[nodeid]
-	deleteat!(nodeList, nodeid)
+    deleteat!(nodeList, nodeid)
         Pex.colLower = copy(node.xl)
         Pex.colUpper = copy(node.xu)
         if hasBin
            Pex.colCat = copy(node.colCat)
         end
 
-	Rold = PlasmoOld.copyModel(Roriginal)
-	#Rold = Roriginal
+    Rold = copyModel(Roriginal)
+    #Rold = Roriginal
 
-	#=
-	if node.parRSol != nothing
-	    println("  node.parRSol:    ", )
-	    Rold.colVal = copy(node.parRSol)
-	end
-	=#
-	updateStoBoundsFromExtensive!(Pex, P)		#updateFirstBounds!(P, node.xl[1:nfirst], node.xu[1:nfirst]) 
-	level = node.level
+    #=
+    if node.parRSol != nothing
+        println("  node.parRSol:    ", )
+        Rold.colVal = copy(node.parRSol)
+    end
+    =#
+    updateStoBoundsFromExtensive!(Pex, P)        #updateFirstBounds!(P, node.xl[1:nfirst], node.xu[1:nfirst])
+    level = node.level
 
         if node.bVarId != -1
            bVarId = node.bVarId
-           Printf.@printf "%-6d %-6d %-6d %-6d %-14.4f %-14.4e %-14.4e %-14.4e %-7.4f %s\n" iter length(nodeList) node.level  bVarId P.colLower[bVarId] P.colUpper[bVarId] LB UB (UB-LB)/min(abs(LB), abs(UB))*100 "%"
+           @printf "%-6d %-6d %-6d %-6d %-14.4f %-14.4e %-14.4e %-14.4e %-7.4f %s\n" iter length(nodeList) node.level  bVarId P.colLower[bVarId] P.colUpper[bVarId] LB UB (UB-LB)/min(abs(LB), abs(UB))*100 "%"
         else
-           Printf.@printf "%-6d %-6d %-40d %-14.4f %-14.4e %-7.4f %s \n" iter length(nodeList) node.level LB UB (UB-LB)/min(abs(LB), abs(UB))*100 "%" 
+           @printf "%-6d %-6d %-40d %-14.4f %-14.4e %-7.4f %s \n" iter length(nodeList) node.level LB UB (UB-LB)/min(abs(LB), abs(UB))*100 "%"
         end
 
         ############# iteratively bound tighting #######################
         reduction_relax = 1
         node_LB = node.LB
-	relaxed_status = :Optimal
-	UB_status = :Optimal
-	delete_nodes = []	
-	feasible = true
+    relaxed_status = :Optimal
+    UB_status = :Optimal
+    delete_nodes = []
+    feasible = true
 
 
-        time_ns()
+        tic()
         relax_LB_time = 0
         while reduction_relax >= 0.1
-            reduction_relax = 0	    	    	   
+            reduction_relax = 0
             if debug
                 println("before feasibility reduction ", P.colLower, "   ", P.colUpper)
-                time_ns()
-            end 
-            ############ FBBT and OBBT (only for first stage variables)#######################
-	    feasible = Sto_medium_feasibility_reduction(P, pr_children, Pex, prex, Rold, UB, LB, bVarsId)	
-	    #feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, LB)
-            if debug
-                println("after initial feasibility reduction ", P.colLower, "   ", P.colUpper, "  ","   time:   ",  time_ns(), " (s)")
+                tic()
             end
-	    updateExtensiveBoundsFromSto!(P, Pex)
+            ############ FBBT and OBBT (only for first stage variables)#######################
+        feasible = Sto_medium_feasibility_reduction(P, pr_children, Pex, prex, Rold, UB, LB, bVarsId)
+        #feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, LB)
+            if debug
+                println("after initial feasibility reduction ", P.colLower, "   ", P.colUpper, "  ","   time:   ",  toq(), " (s)")
+            end
+        updateExtensiveBoundsFromSto!(P, Pex)
             if !feasible
                node_LB = UB
                break
             end
-	   
+       
             ############ probing ###################################################
-	    if probing && feasible && level <= 1	      
+        if probing && feasible && level <= 1
                 if debug
-                    time_ns()
+                    tic()
                 end
-		n_reduced_probing = 1		 
-		#while n_reduced_probing > 0
-		i = 1
-	    	n_reduced_probing = 0
-	    	while i<= nfirst
+        n_reduced_probing = 1
+        #while n_reduced_probing > 0
+        i = 1
+            n_reduced_probing = 0
+            while i<= nfirst
 
                     xl = P.colLower[i]
                     xu = P.colUpper[i]
-		    println(i,"    ", xl, "    ",xu)
+            println(i,"    ", xl, "    ",xu)
                     if (xu - xl) <= small_bound_improve
                         i = i + 1
                         continue
@@ -342,11 +302,11 @@ function branch_bound(m)
                     if relaxed_status == :Optimal && relaxed_LB >= UB
                             if Rprobing.redCosts[i] <= -1e-4
                                 P.colLower[i] = xl + (relaxed_LB-UB)/abs(Rprobing.redCosts[i])
-				n_reduced_probing += 1
-                		if debug
-				    println("update P.colLower")
+                n_reduced_probing += 1
+                        if debug
+                    println("update P.colLower")
                                     println("updated point", P.colLower[i] , "xl",xl, "   dual ", Rprobing.redCosts[i])
-				end
+                end
                             end
                     end
                     updateFirstBounds!(P, P.colLower, P.colUpper)
@@ -359,93 +319,93 @@ function branch_bound(m)
                     println("relaxed_status  ", relaxed_status, " relaxed_LB   ",relaxed_LB, "  UB  ",UB)
                     if relaxed_status == :Optimal && relaxed_LB >= UB
                             if Rprobing.redCosts[i] <= -1e-4
-			        P.colUpper[i] = xu - (relaxed_LB-UB)/abs(Rprobing.redCosts[i])
-				n_reduced_probing += 1
-				if debug				
+                    P.colUpper[i] = xu - (relaxed_LB-UB)/abs(Rprobing.redCosts[i])
+                n_reduced_probing += 1
+                if debug
                                     println("update P.colUpper")
                                     println("R    ", Rprobing.colVal[i])
                                     println("updated point", P.colUpper[i] , " xu ", xu, "   dual ", Rprobing.redCosts[i])
-				end
+                end
                             end
                     end
                     updateFirstBounds!(P, P.colLower, P.colUpper)
 
 
-   		    xl = P.colLower[i]
-    		    xu = P.colUpper[i]
-		    if (xu - xl) <= small_bound_improve
-		        i = i + 1
-		    	continue    
-		    end
-		    updateStoBoundsFromSto!(P, Pprobing)		
-		    leftPoint = xl + (xu - xl)/3
-		    #=
-		    if level == 1
-		       leftPoint = xl + (xu - xl)/6
-		    end
-		    =#
-		    updateFirstBounds!(Pprobing, xl, leftPoint, i)
-		    updateExtensiveBoundsFromSto!(Pprobing, Pex_probing)
-		    feasible_left = Sto_fast_feasibility_reduction!(Pprobing, pr_children, Pex_probing, prex, Rold, UB, LB, 0, true)	   
-		    if !feasible_left
-		        P.colLower[i] = leftPoint
-		    else
-			P.colLower[i] = Pprobing.colLower[i]	   
-		    end	
-		    updateFirstBounds!(P, P.colLower, P.colUpper)		    
-		    updateStoBoundsFromSto!(P, Pprobing)
+               xl = P.colLower[i]
+                xu = P.colUpper[i]
+            if (xu - xl) <= small_bound_improve
+                i = i + 1
+                continue
+            end
+            updateStoBoundsFromSto!(P, Pprobing)
+            leftPoint = xl + (xu - xl)/3
+            #=
+            if level == 1
+               leftPoint = xl + (xu - xl)/6
+            end
+            =#
+            updateFirstBounds!(Pprobing, xl, leftPoint, i)
+            updateExtensiveBoundsFromSto!(Pprobing, Pex_probing)
+            feasible_left = Sto_fast_feasibility_reduction!(Pprobing, pr_children, Pex_probing, prex, Rold, UB, LB, 0, true)
+            if !feasible_left
+                P.colLower[i] = leftPoint
+            else
+            P.colLower[i] = Pprobing.colLower[i]
+            end
+            updateFirstBounds!(P, P.colLower, P.colUpper)
+            updateStoBoundsFromSto!(P, Pprobing)
 
 
-		    rightPoint = xu - (xu - xl)/3	
-		    #=
-		    if level ==	 1
-		       rightPoint = xu - (xu - xl)/6
-		    end
-		    =#	
-		    updateFirstBounds!(Pprobing, rightPoint, xu, i)
-		    updateExtensiveBoundsFromSto!(Pprobing, Pex_probing)
-		    feasible_right = Sto_fast_feasibility_reduction!(Pprobing, pr_children, Pex_probing, prex, Rold, UB, LB, 0, true)
-		    if !feasible_right
-		        P.colUpper[i] = rightPoint
-		    else
-			P.colUpper[i] = Pprobing.colUpper[i]	    
-		    end
-		    updateFirstBounds!(P, P.colLower, P.colUpper) 		    
+            rightPoint = xu - (xu - xl)/3
+            #=
+            if level ==     1
+               rightPoint = xu - (xu - xl)/6
+            end
+            =#
+            updateFirstBounds!(Pprobing, rightPoint, xu, i)
+            updateExtensiveBoundsFromSto!(Pprobing, Pex_probing)
+            feasible_right = Sto_fast_feasibility_reduction!(Pprobing, pr_children, Pex_probing, prex, Rold, UB, LB, 0, true)
+            if !feasible_right
+                P.colUpper[i] = rightPoint
+            else
+            P.colUpper[i] = Pprobing.colUpper[i]
+            end
+            updateFirstBounds!(P, P.colLower, P.colUpper)
 
 
 
-		    if !feasible_left || !feasible_right
-			   n_reduced_probing += 1		      			   
+            if !feasible_left || !feasible_right
+               n_reduced_probing += 1
                            if debug
                                println("A ", P.colLower, "     ", P.colUpper)
                            end
-                    	   feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, LB, 0, true)
+                           feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, LB, 0, true)
                            if debug
                                println("B ", P.colLower, "     ", P.colUpper, feasible)
                            end
-			   if !feasible
-			       n_reduced_probing = 0 
-			       break
-			   end			   			  
-		    else
-		        i = i + 1
-		    end		    
-	        end	
-		#end
-           	updateExtensiveBoundsFromSto!(P, Pex)
+               if !feasible
+                   n_reduced_probing = 0
+                   break
+               end
+            else
+                i = i + 1
+            end
+            end
+        #end
+               updateExtensiveBoundsFromSto!(P, Pex)
                 if debug
                     println("after probing ", P.colLower, "   ", P.colUpper)
-                    println("probing time:   ",  time_ns(), " (s)", feasible)
+                    println("probing time:   ",  toq(), " (s)", feasible)
                 end
-	    end
+        end
             if !feasible
                break
             end
 
             ############### Lowerbound from relaxed probelm ##########################################
-	    time_ns()
-	    relaxed_status, relaxed_LB, R, reduction_relax = getRelaxLowerBoundBT!(P, pr_children, Rold, Pex, prex, UB, node.LB)
-            relax_LB_time_this = time_ns()
+        tic()
+        relaxed_status, relaxed_LB, R, reduction_relax = getRelaxLowerBoundBT!(P, pr_children, Rold, Pex, prex, UB, node.LB)
+            relax_LB_time_this = toq()
             relax_LB_time += relax_LB_time_this
             println("reduction_relax", reduction_relax)
             node_LB = max(node_LB, relaxed_LB)
@@ -463,13 +423,13 @@ function branch_bound(m)
                 break
             end
 
-	    node.LB = node_LB
+        node.LB = node_LB
             LB, ~ = getGlobalLowerBound(nodeList, FLB, UB)
             if LB >= node_LB
                 LB = node_LB
             end
-	end    
-        BT_time_total += time_ns() - relax_LB_time
+    end
+        BT_time_total += toq() - relax_LB_time
         relax_LB_time_total += relax_LB_time
 
         if (!feasible)  || (relaxed_status == :Infeasible)
@@ -478,10 +438,10 @@ function branch_bound(m)
         end
 
         ####### if relaxed problem is solved sucessfully, copy R to Rold #######
-	Rsol = copy(R.colVal)
-	#To do: check if can be moved within loop
+    Rsol = copy(R.colVal)
+    #To do: check if can be moved within loop
         if relaxed_status == :Optimal
-	    Rold = PlasmoOld.copyModel(R)
+        Rold = copyModel(R)
         end
         if relaxed_status == :Optimal && hasBin
             Pex.colVal = copy(Rsol[1:Pex.numCols])
@@ -493,13 +453,13 @@ function branch_bound(m)
         WS_status = :NotOptimal
         WSfirst = zeros(nfirst)
         WSSol = nothing
-	    
-        time_ns()
+        
+        tic()
         updateStoBoundsFromExtensive!(Pex, PWS)
         WS_status, WS_LB, WSfirst, WSSol = getWSLowerBound(PWS, node.parWSSol, UB) #(UB-LB)/2, (UB-LB)/abs(LB)/2
         updateStoBoundsFromSto!(PWS, P)
         updateExtensiveBoundsFromSto!(P, Pex)
-        global_LB_time = time_ns()
+        global_LB_time = toq()
         global_LB_time_total += global_LB_time
         if debug
             println("WS_status  ", WS_status, "  WS_LB ", WS_LB)
@@ -549,7 +509,7 @@ function branch_bound(m)
         #if lower bound is inferior than Upper bound, delete
         if ((UB-node_LB)<= mingap || ((UB-node_LB) <= mingap *min(abs(node_LB), abs(UB))))
             continue  #break
-        end	   
+        end
 
 
         #Upper Bound
@@ -561,11 +521,11 @@ function branch_bound(m)
             updateStoSolFromExtensive!(Pex, P)
             updateStoSolFromExtensive!(Pex, PWSfix)
         end
-        time_ns()
+        tic()
         UB_status, WSfix_status, node_UB, local_UB, local_UB_time = getUpperBound!(Pex, prex, PWSfix, P, node_LB, WS_status, WSfirst, level)
         local_UB_time_total += local_UB_time
-        global_UB_time_total += time_ns() - local_UB_time
-	println("upper time:   ", local_UB_time_total, " (s)")
+        global_UB_time_total += toq() - local_UB_time
+    println("upper time:   ", local_UB_time_total, " (s)")
 
         if (local_UB - node_UB) >= machine_error
             LB_UB_list[iter][4] = 2
@@ -602,20 +562,20 @@ function branch_bound(m)
                     continue   #break
                 end
                 updateExtensiveBoundsFromSto!(P, Pex)
-                println("after multiplier medium feasibility reduction ", P.colLower, "   ", P.colUpper)	   
-    	end
+                println("after multiplier medium feasibility reduction ", P.colLower, "   ", P.colUpper)
+        end
 
-	#branch
+    #branch
         if ((UB-node_LB)<= mingap) || ((UB-node_LB) <= mingap*min(abs(UB), abs(node_LB)))
             if (UB-node_LB)>=0  && (node_LB <= FLB)
                 FLB = node_LB
                 println("update FLB when closed to UB  ", FLB)
             end
         else
-	    time_ns()
-	    max_score = 0
-	    child_left_LB = node_LB
-	    child_right_LB = node_LB	 
+        tic()
+        max_score = 0
+        child_left_LB = node_LB
+        child_right_LB = node_LB
             binForBranch = false
             exitBranch = false
 
@@ -628,29 +588,29 @@ function branch_bound(m)
                     println("binForBranch  ", binForBranch, "   bVarId   ",bVarId)
                     break
                 end
-            end   
-	    
-	    if !binForBranch
-	        #=
-	        if node.parmaxScore >= max_score_min   
-		    bVarId, max_score, exitBranch, child_left_LB, child_right_LB, FLB, node_LB = SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, Pex_child, WSSol, Rold, prex, UB, node_LB, Pex, FLB, node, pr_children, P_child)
-	        end		
+            end
+        
+        if !binForBranch
+            #=
+            if node.parmaxScore >= max_score_min
+            bVarId, max_score, exitBranch, child_left_LB, child_right_LB, FLB, node_LB = SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, Pex_child, WSSol, Rold, prex, UB, node_LB, Pex, FLB, node, pr_children, P_child)
+            end
                 if max_score <= max_score_min
                     bVarId = SelectVarMaxRange(bVarsId, P)
                 end
-		=#
-		bVarId = SelectVarMaxRange(bVarsId, P)
+        =#
+        bVarId = SelectVarMaxRange(bVarsId, P)
                 bValue = computeBvalue(Pex, P, bVarId, Rsol, WSfirst, WS_status, relaxed_status)
             end
-            VS_time = time_ns()
+            VS_time = toq()
             VS_time_total += VS_time
             println("var select time:   ",  VS_time, " (s)")
             if exitBranch
                 continue
             end
-	    println("bVarId:  ", bVarId, "  bValue: ", bValue, "        ", Pex.colLower[bVarId], "          ",Pex.colUpper[bVarId],"   node_LB  ", node_LB)
+        println("bVarId:  ", bVarId, "  bValue: ", bValue, "        ", Pex.colLower[bVarId], "          ",Pex.colUpper[bVarId],"   node_LB  ", node_LB)
             branch!(nodeList, P, Pex, bVarId, bValue, node, node_LB, WSSol, child_left_LB, child_right_LB, WS_status, relaxed_status, Rsol, max_score)
-	end
+    end
     end
     if nodeList==[]
        println("all node solved")
@@ -660,14 +620,14 @@ function branch_bound(m)
             LB = min(UB-mingap, UB*(1+mingap))
        end
     end
-    if iter>=2 
+    if iter>=2
         LB_UB_list[iter-1][1] = LB
         LB_UB_list[iter-1][2] = UB
-    end   
+    end
     m.colVal = x
     P.colVal = x
     P.objVal = UB
-    println("Solution time:   ",  time_ns(), " (s)")
+    println("Solution time:   ",  toq(), " (s)")
     println("solved nodes:  ",iter)
     println("relax_LB_time_total:   ", relax_LB_time_total, " (s)")
     println("global_LB_time_total:   ", global_LB_time_total, " (s)")
@@ -675,51 +635,51 @@ function branch_bound(m)
     println("global_UB_time_total:   ", global_UB_time_total, " (s)")
     println("BT_time_total:   ", BT_time_total, " (s)")
     println("VS_time_total:   ", VS_time_total, " (s)")
-    Printf.@printf "%-52d  %-14.4e %-14.4e %-7.4f %s \n" iter  LB UB (UB-LB)/min(abs(LB),abs(UB))*100 "%"
+    @printf "%-52d  %-14.4e %-14.4e %-7.4f %s \n" iter  LB UB (UB-LB)/min(abs(LB),abs(UB))*100 "%"
     println("first stage sol   ",x)
     println("LB_UB_list   ", LB_UB_list)
     return P, LB_UB_list
 end
 
 
-function getRelaxLowerBoundBT!(P, pr_children, Rold, Pex, prex, UB, defaultLB, nsolve = 20)	 
-	    reduction_all = 0
-	    reduction_first = 0
-	    nfirst = P.numCols
-	    xlold = copy(Pex.colLower)
-            xuold = copy(Pex.colUpper)	
+function getRelaxLowerBoundBT!(P, pr_children, Rold, Pex, prex, UB, defaultLB, nsolve = 20)
+        reduction_all = 0
+        reduction_first = 0
+        nfirst = P.numCols
+        xlold = copy(Pex.colLower)
+            xuold = copy(Pex.colUpper)
             relaxed_status, relaxed_LB, R = getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, true, nsolve)
             if relaxed_status == :Optimal && ( (UB-relaxed_LB)<= mingap || (UB-relaxed_LB)/abs(relaxed_LB) <= mingap)
-	        return (relaxed_status, relaxed_LB, R, reduction_first)
+            return (relaxed_status, relaxed_LB, R, reduction_first)
             end
             if relaxed_status == :Infeasible
                 relaxed_LB = UB
-		return (relaxed_status, relaxed_LB, R, reduction_first)
+        return (relaxed_status, relaxed_LB, R, reduction_first)
             elseif relaxed_status == :Optimal
                 Pex.colLower = R.colLower[1:length(Pex.colLower)]
                 Pex.colUpper = R.colUpper[1:length(Pex.colUpper)]
                 reduced_cost_BT!(Pex, prex, R, UB, relaxed_LB)
-		fb = fast_feasibility_reduction!(R, nothing, UB)
-            	if !fb
+        fb = fast_feasibility_reduction!(R, nothing, UB)
+                if !fb
                    relaxed_status = :Infeasible
                    relaxed_LB = UB
-		   return (relaxed_status, relaxed_LB, R, reduction_first)
+           return (relaxed_status, relaxed_LB, R, reduction_first)
                 end
-        	Pex.colLower = R.colLower[1:length(Pex.colLower)]
-        	Pex.colUpper = R.colUpper[1:length(Pex.colUpper)]
+            Pex.colLower = R.colLower[1:length(Pex.colLower)]
+            Pex.colUpper = R.colUpper[1:length(Pex.colUpper)]
                 updateStoBoundsFromExtensive!(Pex, P)
             end
 
-	    left_all = 1
+        left_all = 1
             for i in 1:length(Pex.colLower)
-            	if (xuold[i] + Pex.colLower[i] - xlold[i] - Pex.colUpper[i]) > small_bound_improve
-		   left_all = left_all * (Pex.colUpper[i] - Pex.colLower[i])/ (xuold[i]- xlold[i])
+                if (xuold[i] + Pex.colLower[i] - xlold[i] - Pex.colUpper[i]) > small_bound_improve
+           left_all = left_all * (Pex.colUpper[i] - Pex.colLower[i])/ (xuold[i]- xlold[i])
                 end
-       	    end
-	    reduction_all = 1 - left_all
+               end
+        reduction_all = 1 - left_all
 
             if reduction_all > 0.1
-	        bVarsId = collect(1:nfirst)
+            bVarsId = collect(1:nfirst)
                 #feasible = Sto_medium_feasibility_reduction(P, pr_children, Pex, prex, Rold, UB, relaxed_LB, bVarsId)
                 feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, relaxed_LB)
                 if !feasible
@@ -729,16 +689,16 @@ function getRelaxLowerBoundBT!(P, pr_children, Rold, Pex, prex, UB, defaultLB, n
                 end
                 updateExtensiveBoundsFromSto!(P, Pex)
 
-            	left_first = 1
-            	for i in 1:nfirst  #length(Pex.colLower)
+                left_first = 1
+                for i in 1:nfirst  #length(Pex.colLower)
                     if (xuold[i] + Pex.colLower[i] - xlold[i] - Pex.colUpper[i]) > small_bound_improve
                         left_first = left_first * (Pex.colUpper[i] - Pex.colLower[i])/ (xuold[i]- xlold[i])
                     end
                 end
-		reduction_first = 1 - left_first
+        reduction_first = 1 - left_first
                 println("after multiplier medium feasibility reduction ", P.colLower, "   ", P.colUpper)
             end
-	    return (relaxed_status, relaxed_LB, R, reduction_first)
+        return (relaxed_status, relaxed_LB, R, reduction_first)
 end
 
 
@@ -746,11 +706,11 @@ end
 function getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, relaxBin = false, nsolve =20)
             #solve relaxed problem and get lower bound of this node
             R = updaterelax(Rold, Pex, prex, UB)
-	    R.solver = GurobiSolver(Method=1, Threads=1, LogToConsole=0,OutputFlag=0) 
-	    #R.solver = GurobiSolver(Method=2, Crossover=0, Threads=1, LogToConsole=0, OutputFlag=0, DualReductions = 0, BarHomogeneous=1)
+        R.solver = GurobiSolver(Method=1, Threads=1, LogToConsole=0,OutputFlag=0)
+        #R.solver = GurobiSolver(Method=2, Crossover=0, Threads=1, LogToConsole=0, OutputFlag=0, DualReductions = 0, BarHomogeneous=1)
             #R = relax(Pex, prex, UB)
             Rx = R.colVal
-	    no_iter_wo_change = 0
+        no_iter_wo_change = 0
 
             if relaxBin && hasBin
                 for i = 1:R.numCols
@@ -761,45 +721,45 @@ function getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, relaxBin = false, ns
             end
 
             if debug
-                time_ns()
+                tic()
             end
             relaxed_status = solve(R)
-	    #=
+        #=
             if relaxed_status != :Infeasible && relaxed_status != :Optimal
                 R.solver = GurobiSolver(Method=1, Threads=1, LogToConsole=0,OutputFlag=0)
                 relaxed_status = solve(R)
                 println("relaxed_status2:   ", relaxed_status)
             end
-	    =#
+        =#
             relaxed_LB = getRobjective(R, relaxed_status, defaultLB)
             if relaxed_status == :Optimal && ( (UB-relaxed_LB)<= mingap || (UB-relaxed_LB) <= mingap*min(abs(relaxed_LB), abs(UB)))
                 if debug
-                    println("iterative relax time:   ",  time_ns(), " (s)", relaxed_status, "    ", relaxed_LB)
+                    println("iterative relax time:   ",  toq(), " (s)", relaxed_status, "    ", relaxed_LB)
                 end
                 return (relaxed_status, relaxed_LB, R)
             end
 
             if relaxed_status == :Optimal
- 	        Rx = R.colVal
+             Rx = R.colVal
                 Limprove = 1e10
-		#addOuterApproximationGrid!(R, prex, 20)
+        #addOuterApproximationGrid!(R, prex, 20)
                 for i=1:nsolve   #&& checkOuterApproximation(R, prex)  #while Limprove >= LP_improve_tol
                     newncon_convex = addOuterApproximation!(R, prex)
                     newncon_aBB = addaBB!(R, prex)
                     if debug
                         println("added con      ", newncon_aBB + newncon_convex)
                     end
-                    if (newncon_aBB + newncon_convex) != 0  
+                    if (newncon_aBB + newncon_convex) != 0
                         relaxed_status_trial = solve(R)
                         old_relaxed_LB = relaxed_LB
-			relaxed_LB_trial = getRobjective(R, relaxed_status_trial, old_relaxed_LB)
-			println("relaxed_LB_trial       ", relaxed_LB_trial)
+            relaxed_LB_trial = getRobjective(R, relaxed_status_trial, old_relaxed_LB)
+            println("relaxed_LB_trial       ", relaxed_LB_trial)
                         if relaxed_status_trial == :Optimal
                             Rx = R.colVal
                             relaxed_LB = relaxed_LB_trial
                             if ( (UB-relaxed_LB)<= mingap || (UB-relaxed_LB) <= mingap*min(abs(relaxed_LB), abs(UB)) )
                                 if debug
-                                    println("iterative relax time:   ",  time_ns(), " (s)", relaxed_status, "    ", relaxed_LB)
+                                    println("iterative relax time:   ",  toq(), " (s)", relaxed_status, "    ", relaxed_LB)
                                 end
                                 return (:Optimal, relaxed_LB, R)
                             end
@@ -811,16 +771,16 @@ function getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, relaxBin = false, ns
                             println("warning!:   ",relaxed_status_trial, "     ",relaxed_LB_trial)
                             break
                         end
-			Limprove = relaxed_LB_trial - old_relaxed_LB
-			if Limprove >= LP_improve_tol
-			    no_iter_wo_change = 0
-			else
-			    no_iter_wo_change += 1	    
-			end
-			if no_iter_wo_change >= 10
-			    break
-			end
-			#=
+            Limprove = relaxed_LB_trial - old_relaxed_LB
+            if Limprove >= LP_improve_tol
+                no_iter_wo_change = 0
+            else
+                no_iter_wo_change += 1
+            end
+            if no_iter_wo_change >= 10
+                break
+            end
+            #=
                         Limprove = relaxed_LB_trial - old_relaxed_LB
                         if Limprove >= LP_improve_tol || Limprove/abs(old_relaxed_LB) >= LP_improve_tol
                             no_iter_wo_change = 0
@@ -830,7 +790,7 @@ function getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, relaxBin = false, ns
                         if no_iter_wo_change >= 3
                             break
                         end
-			=#
+            =#
                     else
                         break
                     end
@@ -838,7 +798,7 @@ function getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB, relaxBin = false, ns
             end
             R.colVal = Rx
             if debug
-                println("iterative relax time:   ",  time_ns(), " (s)", relaxed_status, "    ", relaxed_LB)
+                println("iterative relax time:   ",  toq(), " (s)", relaxed_status, "    ", relaxed_LB)
                 println("relaxed_LB  ",relaxed_LB)
             end
             return (relaxed_status, relaxed_LB, R)
@@ -864,11 +824,11 @@ function getWSLowerBound(PWS::JuMP.Model, parWSSol, UB)
                     secondSol = parWSSol.secondSols[idx]
                     scenario.colVal = copy(secondSol)
                     if inBounds(scenario, secondSol)
-		        scenario_LB =  parWSSol.secondobjVals[idx]
+                scenario_LB =  parWSSol.secondobjVals[idx]
                         if debug
                             println("  in bounds  ")
                             println("obj  ", scenario_LB)
-			    #println("sol  ", secondSol)
+                #println("sol  ", secondSol)
                         end
                         for k = 1:nfirst
                             varid = scenario.ext[:firstVarsId][k]
@@ -879,50 +839,50 @@ function getWSLowerBound(PWS::JuMP.Model, parWSSol, UB)
                         WS_LB += scenario_LB
                         WSSol.secondSols[idx] = secondSol
                         WSSol.secondobjVals[idx] = scenario_LB
-			JuMP.setlowerbound(scenario[:objective_value], scenario_LB)
+            JuMP.setlowerbound(scenario[:objective_value], scenario_LB)
                         continue
                     end
                 end
 
-                scenariocopy = PlasmoOld.copyModel(scenario)
-    		if hasBin
-        	    fixBinaryVar(scenariocopy)
-    		end
+                scenariocopy = copyModel(scenario)
+            if hasBin
+                fixBinaryVar(scenariocopy)
+            end
                 scenariocopy.solver = IpoptSolver(print_level = 0, max_cpu_time = 100.0)
                 scenariocopy_status = solve(scenariocopy)
-		# check unbounded, if unbounded, lowerbound->-1e10
-		if (scenariocopy_status == :Unbounded) || (scenariocopy_status == :Optimal&& (getobjectivevalue(scenario) <= -1e10))
-		    WS_status = :NotOptimal
+        # check unbounded, if unbounded, lowerbound->-1e10
+        if (scenariocopy_status == :Unbounded) || (scenariocopy_status == :Optimal&& (getobjectivevalue(scenario) <= -1e10))
+            WS_status = :NotOptimal
                     WS_LB = - 1e20
                     break
                 elseif scenariocopy_status == :Optimal && parWSSol == nothing ##
                     scenario.colVal = copy(scenariocopy.colVal)
                 end
-		
+        
                 if scenariocopy_status == :Optimal
                     scenario.solver = SCIPSolver("limits/time", 100.0, "display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2, "setobjlimit", scenariocopy.objVal + 0.01)
                 else
                     scenario.solver = SCIPSolver("limits/time", 100.0, "display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2)
                 end
-		#JuMP.build(scenario)
-		#SCIP.setwarmstart!(scenario.internalModel, scenario.colVal)
+        #JuMP.build(scenario)
+        #SCIP.setwarmstart!(scenario.internalModel, scenario.colVal)
                 #scenario.solver = AmplNLSolver("/opt/scipoptsuite-3.2.1/scip-3.2.1/interfaces/ampl/bin/scipampl")
                 #scenario.solver = BaronSolver()
                 #push!(scenario.solver.options, (:EpsA, mingap/nscen), (:EpsR, mingap), (:MaxTime, 100))#,(:PrLevel, 0))
 
                 scenario_status = solve(scenario)
-		scenario_LB = getobjbound(scenario) #getobjbound(scenario.internalModel)
-		if scenariocopy_status == :Optimal && scenario_status == :Infeasible
-		    scenario_status = :Optimal
-		    scenario.colVal = copy(scenariocopy.colVal)
-		    scenario.objVal = scenariocopy.objVal
-		    scenario_LB = scenariocopy.objVal
+        scenario_LB = getobjbound(scenario) #getobjbound(scenario.internalModel)
+        if scenariocopy_status == :Optimal && scenario_status == :Infeasible
+            scenario_status = :Optimal
+            scenario.colVal = copy(scenariocopy.colVal)
+            scenario.objVal = scenariocopy.objVal
+            scenario_LB = scenariocopy.objVal
                 end
                 projection!(scenario.colVal, scenario.colLower, scenario.colUpper)
-    		if debug
+            if debug
                     println("  scenario :  ", idx, "   WS  scip status", scenario_status, "  obj ", getobjectivevalue(scenario), " lb  ", scenario_LB)
                     #println("WS  scip solution     ", scenario.colVal)
-		end
+        end
 
                 if scenario_status == :Optimal || scenario_status == :UserLimit
                     for k = 1:nfirst
@@ -931,18 +891,18 @@ function getWSLowerBound(PWS::JuMP.Model, parWSSol, UB)
                             push!(WSfirstSol[k], scenario.colVal[varid])
                         end
                     end
-		    JuMP.setlowerbound(scenario[:objective_value], scenario_LB)
+            JuMP.setlowerbound(scenario[:objective_value], scenario_LB)
                     WS_LB += scenario_LB                        #getobjectivevalue(scenario)
                     WSSol.secondSols[idx] = scenario.colVal
                     WSSol.secondobjVals[idx] = scenario_LB
-		    
-		    currentLB = 0
-		    for (idx,scenariotemp) in enumerate(scenariosWS)
-		        currentLB += JuMP.getlowerbound(scenariotemp[:objective_value])
-		    end
-		    if ( (UB-currentLB)<= mingap || (UB-currentLB) <= mingap*abs(currentLB))
-		        WS_status = :Infeasible
-		        break
+            
+            currentLB = 0
+            for (idx,scenariotemp) in enumerate(scenariosWS)
+                currentLB += JuMP.getlowerbound(scenariotemp[:objective_value])
+            end
+            if ( (UB-currentLB)<= mingap || (UB-currentLB) <= mingap*abs(currentLB))
+                WS_status = :Infeasible
+                break
                     end
                 elseif   scenario_status == :Infeasible
                     WS_status = :Infeasible
@@ -950,36 +910,36 @@ function getWSLowerBound(PWS::JuMP.Model, parWSSol, UB)
                 else
                     WS_status = :NotOptimal
                     println("lower bound scip not optimal")
-		    error("WS_status  NotOptimal")
+            error("WS_status  NotOptimal")
                     #break
                 end
             end
-	    if  WS_status == :Optimal
-            	for k = 1:nfirst
+        if  WS_status == :Optimal
+                for k = 1:nfirst
                     WSfirst[k] = median(WSfirstSol[k])
                 end
-	    end
+        end
             return (WS_status, WS_LB, WSfirst, WSSol)
 end
 
 
 
-function getLowerBound(PWS::JuMP.Model, parWSSol, Rold, Pex, prex, UB, defaultLB)	    
-	    nfirst = PWS.numCols
-	    relaxed_status, relaxed_LB, R = getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB)
-	    if relaxed_status == :Optimal && ( (UB-relaxed_LB)<= mingap || (UB-relaxed_LB)/abs(relaxed_LB) <= mingap)
+function getLowerBound(PWS::JuMP.Model, parWSSol, Rold, Pex, prex, UB, defaultLB)
+        nfirst = PWS.numCols
+        relaxed_status, relaxed_LB, R = getRelaxLowerBound(Rold, Pex, prex, UB, defaultLB)
+        if relaxed_status == :Optimal && ( (UB-relaxed_LB)<= mingap || (UB-relaxed_LB)/abs(relaxed_LB) <= mingap)
                 return (:Optimal, relaxed_LB, :NotOptimal, :Optimal, relaxed_LB, nothing, R, nothing)
             end
-	    
-	    LB = relaxed_LB
-	    LB_status = relaxed_status
+        
+        LB = relaxed_LB
+        LB_status = relaxed_status
             WS_LB = -1e10
             WS_status = :NotOptimal
             WSfirst = zeros(nfirst)
-	    WSSol = nothing
-	    updateStoBoundsFromExtensive!(Pex, PWS)
-	    WS_status, WS_LB, WSfirst, WSSol = getWSLowerBound(PWS, parWSSol, UB, mingap, mingap)
-	    
+        WSSol = nothing
+        updateStoBoundsFromExtensive!(Pex, PWS)
+        WS_status, WS_LB, WSfirst, WSSol = getWSLowerBound(PWS, parWSSol, UB, mingap, mingap)
+        
             if WS_status == :Infeasible
                 return (:Infeasible, UB, 0, 0, 0, UB, 0, 0)
             end
@@ -995,18 +955,18 @@ end
 
 
 function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WSfirst, level)
-	    updateStoBoundsFromSto!(P, PWSfix)				    
-	    nfirst = P.numCols
+        updateStoBoundsFromSto!(P, PWSfix)
+        nfirst = P.numCols
             UB = 1e10
-	    UB_status = false
-	    # to do, check if the solution of relaxation and WS are feasible
- 	    WSfix_status = :NotOptimal
+        UB_status = false
+        # to do, check if the solution of relaxation and WS are feasible
+         WSfix_status = :NotOptimal
 
-	    
-	    time_ns()
-	    # To do: Binary fix
+        
+        tic()
+        # To do: Binary fix
             local_status = Ipopt_solve(P) #ParPipsNlp_solve(P)
-	    local_UB = 1e10
+        local_UB = 1e10
             if local_status == :Optimal
                     local_UB = getsumobjectivevalue(P)
                     if local_UB < UB
@@ -1015,13 +975,13 @@ function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WS
                     end
                     println("local_UB  ", local_status, local_UB)
             end
-	    local_UB_time = time_ns()
-	    
+        local_UB_time = toq()
+        
 
-	    #=
-            time_ns()
+        #=
+            tic()
             updateExtensiveBoundsFromSto!(P, Pex)
-            Pex_local = PlasmoOld.copyModel(Pex)
+            Pex_local = copyModel(Pex)
             if hasBin
                 fixBinaryVar(Pex_local)
             end
@@ -1032,7 +992,7 @@ function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WS
             if local_status == :Optimal
                 Pex.colVal = copy(Pex_local.colVal)
                 Pex.objVal = Pex_local.objVal
-		local_UB = Pex.objVal
+        local_UB = Pex.objVal
                 updateStoSolFromExtensive!(Pex, P)
                 if local_UB < UB
                     UB_status = local_status
@@ -1042,46 +1002,46 @@ function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WS
                     println("local_UB  ", local_status, local_UB)
                 end
             end
-            local_UB_time = time_ns()
-	    =#
+            local_UB_time = toq()
+        =#
 
-	    #=
-	    local_status = :NotOptimal
-	    updateExtensiveBoundsFromSto!(P, Pex)
+        #=
+        local_status = :NotOptimal
+        updateExtensiveBoundsFromSto!(P, Pex)
             Pex.solver = IpoptSolver()
             local_status = solve(Pex)
-	    local_UB = 1e10
+        local_UB = 1e10
             if local_status == :Optimal
-	        updateStoSolFromExtensive!(Pex, P)
-		local_UB = Pex.objVal
+            updateStoSolFromExtensive!(Pex, P)
+        local_UB = Pex.objVal
                 if local_UB < UB
                     UB_status = local_status
                     UB = local_UB
                 end
-		println("local_UB  ", local_status, local_UB)
+        println("local_UB  ", local_status, local_UB)
             end
-	    =#
+        =#
 
-	    if level <=2 || level%3 == 0
+        if level <=2 || level%3 == 0
                 if ((local_status == :Optimal || WS_status==:Optimal) && (UB-node_LB)>= mingap && (UB-node_LB) >=mingap*min(abs(node_LB), abs(UB)))
                     ### To do: what if WSfixfirst don't exit, or not within bounds
-		    if local_status == :Optimal
-		        WSfixfirst = copy(P.colVal)  
-		    else   
-		    	WSfixfirst = copy(WSfirst)
-		    end	
+            if local_status == :Optimal
+                WSfixfirst = copy(P.colVal)
+            else
+                WSfixfirst = copy(WSfirst)
+            end
                     WSfix_UB = 0
                     WSfix_status = :Optimal
-		    scenariosWSfix = PlasmoOld.getchildren(PWSfix)
-		    scenarios = PlasmoOld.getchildren(P)
-            	    nscen = length(scenariosWSfix)
+            scenariosWSfix = PlasmoOld.getchildren(PWSfix)
+            scenarios = PlasmoOld.getchildren(P)
+                    nscen = length(scenariosWSfix)
 
                     for (idx,scenarioWSfix) in enumerate(scenariosWSfix)
-                    	if local_status == :Optimal
+                        if local_status == :Optimal
                             scenarioWSfix.colVal = copy(scenarios[idx].colVal)
                         end
                         firstVarsId = scenarioWSfix.ext[:firstVarsId]
-                   	for k = 1:nfirst
+                       for k = 1:nfirst
                             varid = firstVarsId[k]
                             if varid != -1
                                 val = WSfixfirst[k]
@@ -1092,29 +1052,29 @@ function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WS
                                         val = 0.0
                                     end
                                 end
-			        scenarioWSfix.colCat[varid] = :Fixed
-                        	scenarioWSfix.colLower[varid] = val
-                        	scenarioWSfix.colUpper[varid] = val
-				scenarioWSfix.colVal[varid] = val
-			    end
-                        end			
-						
+                    scenarioWSfix.colCat[varid] = :Fixed
+                            scenarioWSfix.colLower[varid] = val
+                            scenarioWSfix.colUpper[varid] = val
+                scenarioWSfix.colVal[varid] = val
+                end
+                        end
+                        
 
-			if local_status == :Optimal			
-			    scenarioWSfix.solver = SCIPSolver("display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2, "limits/time", 100.0, "setobjlimit", scenarios[idx].objVal + 0.01)
-			else 
-			    scenarioWSfix.solver = SCIPSolver("display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2, "limits/time", 100.0)	     
-			end
+            if local_status == :Optimal
+                scenarioWSfix.solver = SCIPSolver("display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2, "limits/time", 100.0, "setobjlimit", scenarios[idx].objVal + 0.01)
+            else
+                scenarioWSfix.solver = SCIPSolver("display/verblevel", 0, "limits/gap", mingap/2, "limits/absgap", mingap/nscen/2, "limits/time", 100.0)
+            end
                         scenarioWSfix_status = solve(scenarioWSfix)
 
-			if local_status == :Optimal && scenarioWSfix_status == :Infeasible
-			   scenarioWSfix_status = :Optimal
-   			   scenarioWSfix.colVal = copy(scenarios[idx].colVal)
-			   scenarioWSfix.objVal =  scenarios[idx].objVal			
+            if local_status == :Optimal && scenarioWSfix_status == :Infeasible
+               scenarioWSfix_status = :Optimal
+                  scenarioWSfix.colVal = copy(scenarios[idx].colVal)
+               scenarioWSfix.objVal =  scenarios[idx].objVal
                         end
 
-			projection!(scenarioWSfix.colVal, scenarioWSfix.colLower, scenarioWSfix.colUpper)
-			println("scenario   ", idx, "    WSfix  scip status       ", scenarioWSfix_status, "  obj ", getobjectivevalue(scenarioWSfix), " lb  ", getobjbound(scenarioWSfix))
+            projection!(scenarioWSfix.colVal, scenarioWSfix.colLower, scenarioWSfix.colUpper)
+            println("scenario   ", idx, "    WSfix  scip status       ", scenarioWSfix_status, "  obj ", getobjectivevalue(scenarioWSfix), " lb  ", getobjbound(scenarioWSfix))
 
 
                         if scenarioWSfix_status == :Optimal  || scenarioWSfix_status == :UserLimit
@@ -1128,28 +1088,28 @@ function getUpperBound!(Pex, prex, PWSfix::JuMP.Model, P, node_LB, WS_status, WS
                             break
                         end
                     end
-                    if WSfix_status == :Optimal 
-			UB_status == WSfix_status
-			if WSfix_UB < UB
+                    if WSfix_status == :Optimal
+            UB_status == WSfix_status
+            if WSfix_UB < UB
                             UB = WSfix_UB
-			end
+            end
                     end
-		    if debug
-                        println("WSfix_status  ", WSfix_status, "  WSfix_UB ", WSfix_UB)
-		    end
-                end	
-	    end	
             if debug
-	        println("node U:", UB)
-	    end
-	    return UB_status, WSfix_status, UB, local_UB, local_UB_time
+                        println("WSfix_status  ", WSfix_status, "  WSfix_UB ", WSfix_UB)
+            end
+                end
+        end
+            if debug
+            println("node U:", UB)
+        end
+        return UB_status, WSfix_status, UB, local_UB, local_UB_time
 end
 
 
 function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, Pex_child, WSSol, Rold, prex, UB, node_LB, Pex, FLB, node, pr_children, P_child)
     node_LB_old = node_LB
     nfirst = length(PWS_child.colVal)
-    exitBranch = false	 
+    exitBranch = false
     child_left_LB = -1e10
     child_right_LB = -1e10
     updateScore!(vs, Pex, P, Rsol, WSfirst, WS_status, relaxed_status)
@@ -1167,30 +1127,30 @@ function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, 
             bVarl = Pex.colLower[varId]
             bVaru = Pex.colUpper[varId]
 
-	    if (bVaru - bVarl) <= small_bound_improve
-	       i = i + 1
-	       continue
-	    end
-	    bValue = computeBvalue(Pex, P, varId, Rsol, WSfirst, WS_status, relaxed_status)
-            if min(vs.n_right[i], vs.n_left[i]) < n_rel && no_consecutive_upates_wo_change <= lambda_consecutive #&& (!vs.tried[i]) 
+        if (bVaru - bVarl) <= small_bound_improve
+           i = i + 1
+           continue
+        end
+        bValue = computeBvalue(Pex, P, varId, Rsol, WSfirst, WS_status, relaxed_status)
+            if min(vs.n_right[i], vs.n_left[i]) < n_rel && no_consecutive_upates_wo_change <= lambda_consecutive #&& (!vs.tried[i])
                 vs.tried[i] = true
                 updateStoBoundsFromExtensive!(Pex, PWS_child)
                 Pex_child.colLower = copy(Pex.colLower)
                 Pex_child.colUpper = copy(Pex.colUpper)
                 updateFirstBounds!(PWS_child, bVarl, bValue, varId)
                 updateExtensiveFirstBounds!(Pex_child, PWS_child, bVarl, bValue, varId)
-		println("varId:   ",varId, "bValue:  ", bValue, "  xl  ", bVarl, "  xu  ", bVaru, "node_LB  ", node_LB)
+        println("varId:   ",varId, "bValue:  ", bValue, "  xl  ", bVarl, "  xu  ", bVaru, "node_LB  ", node_LB)
 
 
-		LB_status_left, obj_left, ~ = getRelaxLowerBound(Rold, Pex_child, prex, UB, node_LB)
+        LB_status_left, obj_left, ~ = getRelaxLowerBound(Rold, Pex_child, prex, UB, node_LB)
                 improve_left = 0
                 if LB_status_left == :Optimal
                      if (((UB- obj_left)<= mingap) || ((UB- obj_left) <=mingap*abs(obj_left)))
                          if ((UB-obj_left)>=0) && (obj_left <= FLB)
                              FLB = obj_left
-			     println("update FLB when select left var  ", FLB)
+                 println("update FLB when select left var  ", FLB)
                          end
-			 P.colLower[varId] = bValue
+             P.colLower[varId] = bValue
                          Pex.colLower[varId] = bValue
                          LB_status_left = :Infeasible
                      end
@@ -1201,24 +1161,24 @@ function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, 
                 elseif LB_status_left == :Infeasible
                     #if LB problem is infeasible, update bounds
                     P.colLower[varId] = bValue
-		    Pex.colLower[varId] = bValue
-		    improve_left = max(0, UB - node_LB_old)
+            Pex.colLower[varId] = bValue
+            improve_left = max(0, UB - node_LB_old)
                     #continue
                 else
                     #if not solved sucessfully, and cannot be proven to be infeasible, continue
                     continue
                 end
-		println("lb  ",Pex.colLower[varId], "ub   ",Pex.colUpper[varId])
-		println("LB_status_left:  ", LB_status_left, "  obj  ", obj_left)
+        println("lb  ",Pex.colLower[varId], "ub   ",Pex.colUpper[varId])
+        println("LB_status_left:  ", LB_status_left, "  obj  ", obj_left)
 
 
-		if LB_status_left == :Infeasible
-		    updateStoBoundsFromExtensive!(Pex, P)
-		    feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, node_LB)
-		    updateExtensiveBoundsFromSto!(P, Pex)		    
-		    updateExtensiveBoundsFromSto!(P, Pex_child)
-		    updateStoBoundsFromSto!(P, PWS_child)
-		end
+        if LB_status_left == :Infeasible
+            updateStoBoundsFromExtensive!(Pex, P)
+            feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, node_LB)
+            updateExtensiveBoundsFromSto!(P, Pex)
+            updateExtensiveBoundsFromSto!(P, Pex_child)
+            updateStoBoundsFromSto!(P, PWS_child)
+        end
 
 
                 updateStoBoundsFromExtensive!(Pex, PWS_child)
@@ -1227,21 +1187,21 @@ function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, 
                 updateFirstBounds!(PWS_child, bValue, bVaru, varId)
                 updateExtensiveFirstBounds!(Pex_child, PWS_child, bValue, bVaru, varId)
 
-		LB_status_right, obj_right, ~ = getRelaxLowerBound(Rold, Pex_child, prex, UB, node_LB)
+        LB_status_right, obj_right, ~ = getRelaxLowerBound(Rold, Pex_child, prex, UB, node_LB)
                 improve_right = 0
-		println("LB_status_right:  ", LB_status_right, "  obj  ", obj_right)
+        println("LB_status_right:  ", LB_status_right, "  obj  ", obj_right)
                 if LB_status_right == :Optimal
                     if (((UB- obj_right)<= mingap) || ((UB- obj_right) <=mingap*abs(obj_right)))
                          if ((UB-obj_right)>=0) && (obj_right <= FLB)
                              FLB = obj_right
-			     println("update FLB when select right  ", FLB)
+                 println("update FLB when select right  ", FLB)
                          end
                          Pex.colUpper[varId] = bValue
-			 P.colUpper[varId] = bValue
+             P.colUpper[varId] = bValue
                          LB_status_right = :Infeasible
-			 if obj_right >= UB
-			     obj_right = UB
-			 end   
+             if obj_right >= UB
+                 obj_right = UB
+             end
                     end
                     improve_right = max(0, obj_right - node_LB_old)
                     nlinfeasibility = bValue - bVarl
@@ -1252,59 +1212,59 @@ function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, 
                     #if relaxed problem is infeasible, update bounds
                     P.colUpper[varId] = bValue
                     Pex.colUpper[varId] = bValue
-		    obj_right = UB
+            obj_right = UB
                     improve_right = max(0, obj_right - node_LB_old)
                     #continue
                 else
                     #if not solved sucessfully, and cannot be proven to be infeasible, continue
                     continue
                 end
-		println("lb   ub",Pex.colLower[varId], Pex.colUpper[varId])
+        println("lb   ub",Pex.colLower[varId], Pex.colUpper[varId])
                 println("LB_status_right:  ", LB_status_right, "  obj  ", obj_right)
 
 
                 if LB_status_right == :Infeasible
-		    updateStoBoundsFromExtensive!(Pex, P)
+            updateStoBoundsFromExtensive!(Pex, P)
                     feasible = Sto_fast_feasibility_reduction!(P, pr_children, Pex, prex, Rold, UB, node_LB)
                     updateExtensiveBoundsFromSto!(P, Pex)
                 end
 
 
                 if LB_status_right == :Infeasible && LB_status_left == :Infeasible
-		        exitBranch = true
-			break
-                end		
-		
-		if (LB_status_right == :Infeasible || LB_status_left == :Infeasible)  #&& ninfeasible <= 1
-		   ninfeasible += 1
-		   continue
-		end
+                exitBranch = true
+            break
+                end
+        
+        if (LB_status_right == :Infeasible || LB_status_left == :Infeasible)  #&& ninfeasible <= 1
+           ninfeasible += 1
+           continue
+        end
 
-		if LB_status_right == :Infeasible && LB_status_left == :Optimal && (obj_left-node_LB)>=0
-		    node_LB = obj_left
-		elseif  LB_status_left == :Infeasible && LB_status_right == :Optimal && (obj_right-node_LB)>=0
-		    node_LB = obj_right	   
-		elseif LB_status_left == :Optimal && LB_status_right == :Optimal && (obj_left-node_LB)>=0 && (obj_right-node_LB)>=0
-		    node_LB = min(obj_left, obj_right)   
-		end
+        if LB_status_right == :Infeasible && LB_status_left == :Optimal && (obj_left-node_LB)>=0
+            node_LB = obj_left
+        elseif  LB_status_left == :Infeasible && LB_status_right == :Optimal && (obj_right-node_LB)>=0
+            node_LB = obj_right
+        elseif LB_status_left == :Optimal && LB_status_right == :Optimal && (obj_left-node_LB)>=0 && (obj_right-node_LB)>=0
+            node_LB = min(obj_left, obj_right)
+        end
 
                 vs.score[i] = compute_score(improve_left, improve_right)
                 println("improve_left:  ", improve_left, "   improve_right:  ", improve_right, " score ",vs.score[i])
 
-		println("LB_status_left  ", LB_status_left, "  obj_left  ", obj_left, "  LB_status_right  ", obj_right)
-        	if vs.score[i] >= max_score
+        println("LB_status_left  ", LB_status_left, "  obj_left  ", obj_left, "  LB_status_right  ", obj_right)
+            if vs.score[i] >= max_score
                     max_score = vs.score[i]
                     bVarId = varId
                     if LB_status_left == :Optimal
                         child_left_LB = obj_left
                         if LB_status_right == :Infeasible
-                    	    child_right_LB = child_left_LB
+                            child_right_LB = child_left_LB
                         end
                     end
                     if LB_status_right == :Optimal
                         child_right_LB = obj_right
                         if LB_status_left == :Infeasible
-                    	    child_left_LB = obj_right
+                            child_left_LB = obj_right
                         end
                     end
                     no_consecutive_upates_wo_change = 0
@@ -1319,11 +1279,11 @@ function SelectVar!(vs, P, Rsol, WSfirst, WS_status, relaxed_status, PWS_child, 
             if (no_consecutive_upates_wo_change > lambda_consecutive && max_score > 0)
                 break
             end
-	    i = i + 1
-	    ninfeasible = 0
+        i = i + 1
+        ninfeasible = 0
     end
     println("bVarId:  ", bVarId, "max_score  ", max_score)
-    updateStoBoundsFromExtensive!(Pex, P)     
+    updateStoBoundsFromExtensive!(Pex, P)
     println("after select", P.colLower, P.colUpper)
     return bVarId, max_score, exitBranch, child_left_LB, child_right_LB, FLB, node_LB
 end
@@ -1393,11 +1353,6 @@ function branch!(nodeList, P, Pex, bVarId, bValue, node, node_LB, WSSol, child_l
     push!(nodeList, right_node)
     if debug
         println("left ", nodeList[end-1].LB, "   ", left_node.LB)
-    	println("right ", nodeList[end].LB, "   ", right_node.LB) 
+        println("right ", nodeList[end].LB, "   ", right_node.LB)
     end
 end
-
-
-
-
-

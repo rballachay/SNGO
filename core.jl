@@ -1904,25 +1904,26 @@ function isaff(expr)
 end	      
 
 
-function hasBinaryVar(m::OptiNode)
-    for (int,var) in m.nodevariables
-    	if var == :Bin
-    	    return true
-	end
-    end	
+function hasBinaryVar(m::JuMP.Model)
+    for i = 1:m.numCols
+        if m.colCat[i] == :Bin
+            return true
+    end
+    end
     return false
 end
 
 
-function numBinaryVar(m::OptiNode)
+function numBinaryVar(m::JuMP.Model)
     n = 0
-    for (int,var) in m.nodevariables
-        if var == :Bin
+    for i = 1:m.numCols
+        if m.colCat[i] == :Bin
             n = n + 1
         end
     end
     return n
 end
+
 
 
 function fixBinaryVar(m::JuMP.Model)

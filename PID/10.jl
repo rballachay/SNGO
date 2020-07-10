@@ -96,13 +96,12 @@ end
 
 NS = 10
 
-function scenario(graph,j,NS)
-    
-    @optinode(graph, m)
-    
+function scenario(S,NS)
+    m = Model()
     global Kc
     global tauI
     global tauD
+    
     
     @variable(m, -10<= Kc <=10, start=1)
     @variable(m, -100<= tauI <=100, start=1)
@@ -126,24 +125,23 @@ function scenario(graph,j,NS)
     @variable(m, costS[s = S])
     @constraint(m, costSdef[s in S], costS[s] == 100/length(T)/NS * sum(cost[s,t] for t in T))
     @objective(m, Min, sum(costS[s] for s in S))
+    
     return m
 end
 
-graph = OptiGraph()
-@optinode(graph,master)
+master=NetModel()
 @variable(master, -10<= Kc <=10, start=1)
 @variable(master, -100<= tauI <=100, start=1)
 @variable(master, -100<= tauD <=1000, start=1)
-nodeList = Array{JuMP.Model}(undef, NS)
+nodes = Array{JuMP.Model}(undef, NS)
 
 for j in 1:NS
-    tempNode = scenario(graph,j:j, NS)
-    @linkconstraint(graph, tempNode[:Kc]==master[:Kc])
-    @linkconstraint(graph, tempNode[:tauI]==master[:tauI])
-    @linkconstraint(graph, tempNode[:tauD]==master[:tauD])
-    print(tempNode,"\n")
+    nodes[j] = scenario(j:j,NS)
+    @addNode(master, nodes[j], "s$j")
+    @constraint(master, getindex(nodes[j],:Kc)==Kc)
+    @constraint(master, getindex(nodes[j],:tauI)==tauI)
+    @constraint(master, getindex(nodes[j],:tauD)==tauD)
 end
- 
 
 
-branch_bound(graph)
+branch_bound(master)

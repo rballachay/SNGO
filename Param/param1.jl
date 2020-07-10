@@ -1,6 +1,6 @@
 using JuMP, Ipopt, DataFrames
 push!(LOAD_PATH, ENV["SINGODIR"])
-include("/SNGO/PlasmoOld/src/PlasmoOld.jl")
+#include("/SNGO/PlasmoOld/src/PlasmoOld.jl")
 # using SCIP
 using .PlasmoOld, Ipopt
 using JuMP
@@ -110,7 +110,7 @@ nstepPpiece = 1
 npiece = Int(ceil((lt0-1)/nstepPpiece))
 println("npiece:   ",npiece)
 m = PlasmoOld.NetModel()
-@variable(m, lowerBoundR1<=r[j]<=upperBoundR1)
+@variable(m, lowerBoundR1<=r<=upperBoundR1)
 @variable(m, lbMat[j,j]<=a[j,j]<=ubMat[j,j])
 @variable(m, 0<=yc[1:(npiece-1)]<=1)
 for i = 1:npiece
