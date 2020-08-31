@@ -67,6 +67,9 @@ function Ipopt_solve(master::JuMP.Model)
          net_colLb = Float64[]
          net_colUb = Float64[]
          net_initval = Float64[]
+         local_initval = Float64[]
+         local_lowbound = Float64[]
+         local_upbound = Float64[]
          net_m = 0
          net_n = 0
          net_hessnnz = 0
@@ -75,26 +78,34 @@ function Ipopt_solve(master::JuMP.Model)
          for (idx,node) in enumerate(modelList)
 	     node.ext[:Data] = IpoptModelData()
              local_data = getData(node)
-             nlp_lb, nlp_ub = JuMP.constraintbounds(node)
-             net_rowLb = [net_rowLb;nlp_lb]
-             net_rowUb = [net_rowUb;nlp_ub]
-             net_colLb = [net_colLb;node.colLower]
-             net_colUb = [net_colUb;node.colUpper]
-             local_initval = copy(node.colVal)
-             if any(isnan,node.colVal)
-                for (indx,colm) in enumerate(node.colVal)
+             # Bounds are constants/coefficients of constraints
+             #nlp_lb, nlp_ub = JuMP.constraintbounds(node)
+             #net_rowLb = [net_rowLb;nlp_lb]
+             #net_rowUb = [net_rowUb;nlp_ub]
+             for var in all_variables(node)
+                try
+                    push!(local_initval,JuMP.start_value(var))
+                    push!(local_lowbound,JuMP.lower_bound(var))
+                    push!(local_upbound,JuMP.upper_bound(var))
+                catch e
+                    continue
+                end
+             end
+             if any(isnan,local_initval)
+                for (indx,colm) in enumerate(local_initval)
                     if isnan(colm)
                         local_initval[indx] = 0
                     end
                 end
                 #local_initval[isnan(node.colVal)] .= 0
-                local_initval = min(max(node.colLower,local_initval),node.colUpper)
+                
+                local_initval = min(max(local_lowbound,local_initval),local_upbound)
              end
              net_initval = [net_initval;local_initval]
-             local_data.m = length(nlp_lb)
-             local_data.n = node.numCols
+             #local_data.m = length(nlp_lb)
+             local_data.n = num_variables(node)
              local_data.relative_n = net_n
-	     net_m += local_data.m
+	     #net_m += local_data.m
              net_n += local_data.n
          end
 
@@ -105,11 +116,11 @@ function Ipopt_solve(master::JuMP.Model)
 
 	 deleted = []
 	 for (idx,node) in enumerate(upModelList)
-	     connectRows = getConnectRows(node)
+	     connectRows,contypes = getConnectRows(node)
 	     s = 1	
              for c in connectRows
-             	 coeffs = node.linconstr[c].terms.coeffs
-             	 vars   = node.linconstr[c].terms.vars
+             	 coeffs = values(JuMP.constraint_object(c).func.terms)
+             	 vars   = keys(JuMP.constraint_object(c).func.terms)
              	 for (it,ind) in enumerate(coeffs)
                      push!(Icon, numconnectRows + s)
                      push!(Jcon, getData(vars[it].m).relative_n + vars[it].col)
@@ -121,15 +132,19 @@ function Ipopt_solve(master::JuMP.Model)
 	     local_data = getData(node)
              local_data.numconnectRows = length(connectRows)
 	     local_data.m = local_data.m - local_data.numconnectRows	  
-	     push!(deleted, node.linconstr[connectRows])
-	     deleteat!(node.linconstr,connectRows)   
+         if length(connectRows)>=1
+            push!(deleted, connectRows)
+            for row in connectRows
+                delete(node,row)
+            end
+        end
 	 end
 	 Mcon = sparse(Icon, Jcon, Vcon, numconnectRows, net_n)
 
 	 for (idx,node) in enumerate(modelList)
 	    local_data = getData(node) 
-            local_data.d = JuMP.NLPEvaluator(node)
-            initialize(local_data.d, [:Grad,:Jac, :Hess])
+            NLPeval = JuMP.NLPEvaluator(node)
+            MOI.initialize(NLPeval, [:Grad,:Jac,:Hess])
             Ihess, Jhess = hesslag_structure(local_data.d)
             local_data.hessnnz = length(Ihess)
             net_hessnnz += local_data.hessnnz
@@ -312,15 +327,25 @@ end
 
 function getConnectRows(master::JuMP.Model)
     connectRows = []
-    for row in 1: length(master.linconstr)
-            coeffs = master.linconstr[row].terms.coeffs
-            vars   = master.linconstr[row].terms.vars
-            for (it,ind) in enumerate(coeffs)
-                if (vars[it].m) != master
-                   push!(connectRows, row)
-                   break
+    
+    greaterThan = [all_constraints(master,GenericAffExpr{Float64,VariableRef},MOI.GreaterThan{Float64})]
+    equalTo = [all_constraints(master,GenericAffExpr{Float64,VariableRef},MOI.EqualTo{Float64})]
+    lessThan = [all_constraints(master,GenericAffExpr{Float64,VariableRef},MOI.LessThan{Float64})]
+    alltypes = [greaterThan;equalTo;lessThan]
+    
+    for type in alltypes
+        for constraint in type
+                conobject = JuMP.constraint_object(constraint)
+                coeffs = [values(conobject.func.terms)]
+                vars   = [keys(conobject.func.terms)]
+                for (i,coeff) in enumerate(coeffs)
+                    try check_belongs_to_model(vars[i],master)
+                       continue
+                    catch e
+                        push!(connectRows, constraint)
+                    end
                 end
-            end
+        end
     end
-    return connectRows
+    return connectRows,alltypes
 end

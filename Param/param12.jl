@@ -5,6 +5,7 @@ using Ipopt
 using JuMP
 using MAT
 include("../bb.jl")
+include("../PlasmoOld/src/PlasmoOld.jl")
  
 
 # User defined Variables ---------------------------------------
@@ -61,6 +62,7 @@ function createMonoPiece(j::Int, t, piece, npiece)
     global yc
 
     m = Model()
+    m.ext[:LinkDict] = Dict{VariableRef,VariableRef}()
     @variable(m, lowerBoundR1<=r[j]<=upperBoundR1)
     @variable(m, lbMat[j,j]<=a[j,j]<=ubMat[j,j])
 
@@ -99,7 +101,7 @@ function createMonoPiece(j::Int, t, piece, npiece)
     else
 	@constraint(m, objective>=10000*(sum((y[numOfDisc*(i-1)]-data[j].abundance[1][i+ind_start])^2 for i in 2:(length(t)))))
     end
-    @objective(m, Min, objective)
+    @objective(m, MOI.MIN_SENSE, objective)
     return m
 end
 
@@ -112,32 +114,22 @@ lt0 = length(time0)
 nstepPpiece = 1   
 npiece = Int(ceil((lt0-1)/nstepPpiece))
 println("npiece:   ",npiece)
-m = NetModel()
+m = PlasmoOld.NetModel()
 @variable(m, lowerBoundR1<=r[j]<=upperBoundR1)
 @variable(m, lbMat[j,j]<=a[j,j]<=ubMat[j,j])
 @variable(m, 0<=yc[1:(npiece-1)]<=1)
 for i = 1:npiece
-           if i < npiece
-              t = time0[(1+nstepPpiece*(i-1)):(nstepPpiece*i+1)]
-           else
-              t = time0[(1+nstepPpiece*(i-1)):lt0]
-           end
-           println(t)
-           node = createMonoPiece(j, t, i, npiece)
-           # add first-stage variables and constraints
-           @addNode(m, node, "s$i")
-           @constraint(m, getindex(node, :r)[j]==r[j])
-           @constraint(m, getindex(node, :a)[j,j]==a[j,j])
-           if i == 1
-               @constraint(m, getindex(node, :yc)[i]==yc[i])
-           elseif i == npiece
-               @constraint(m, getindex(node, :yc)[i-1]==yc[i-1])
-           else
-               @constraint(m, getindex(node, :yc)[i-1]==yc[i-1])
-               @constraint(m, getindex(node, :yc)[i]==yc[i])
-           end
+       if i < npiece
+          t = time0[(1+nstepPpiece*(i-1)):(nstepPpiece*i+1)]
+       else
+          t = time0[(1+nstepPpiece*(i-1)):lt0]
+       end
+       println(t)
+       node = createMonoPiece(j, t, i, npiece)
+       # add first-stage variables and constraints
+       PlasmoOld.@addNode(m, node, "s$i")
+       push!(node.ext[:LinkDict],node[:r][j]=>m[:r][j])
 end
-
 
 branch_bound(m)
 

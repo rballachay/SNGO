@@ -1,27 +1,41 @@
 push!(LOAD_PATH, pwd())
-using Gurobi, JuMP, Ipopt, SCIP, PlasmoOld,Printf,MathProgBase
+using Gurobi, JuMP, Ipopt, SCIP,Printf,MathProgBase
 import MathProgBase.SolverInterface
+import DataStructures.OrderedDict
 using Distributions
 include("core.jl")
-
+include("PlasmoOld/src/NetIpopt.jl")
+include("PlasmoOld/src/PlasmoOld.jl")
 
 function branch_bound(m)
-    time_ns()
+
+    start_time = time_ns()
     #Ipopt_solve(m)
-    P = copyStoModel(m)
+    
+    # Copy model and extensions to new pointer
+    P = PlasmoOld.copyNet(m)
     scenarios = PlasmoOld.getchildren(P)
+    constrTypes = list_of_constraint_types(scenarios[1])
+    numConstr = sum([num_constraints(scenarios[1], func, set) for (func,set) in constrTypes])
+    
     global nscen = length(scenarios)
     global nfirst = num_variables(P)
     println("No. of first stage variables  ", num_variables(P))
     println("No. of second stage variables ", num_variables(scenarios[1]))
-    #println("No. of second stage constraints ", MathProgBase.numconstr(scenarios[1]))
+    println("No. of second stage constraints ", numConstr)
     println("No. of scenarios  ", length(scenarios))
-    Pcount = extensiveSimplifiedModel(P)
+    
+    # Convert to extensive form and get total number of variables/constraints
+    Pcount = PlasmoOld.extensiveSimplifiedModel(P)
     global hasBin = hasBinaryVar(Pcount)
+    constrTypes = list_of_constraint_types(Pcount)
+    numConstr = sum([num_constraints(Pcount, func, set) for (func,set) in constrTypes])
+    
     println("No. of total variables ", num_variables(Pcount))
-    #println("No. of total constraints ", MathProgBase.numconstr(Pcount))
+    println("No. of total constraints ", numConstr)
     println("No. of binary variables ", numBinaryVar(Pcount))
-    println("No. of continuous variables ", Pcount.numCols-numBinaryVar(Pcount))
+    println("No. of continuous variables ", num_variables(Pcount)-numBinaryVar(Pcount),"\n")
+    
     Pcount = 1
 
     relax_LB_time_total = 0
@@ -31,76 +45,68 @@ function branch_bound(m)
     BT_time_total = 0
     VS_time_total = 0
 
-
-
 #### get initial UB #########################################
     UB = 1e10
-    Pex_local = extensiveSimplifiedModel(P)
+    Pex_local = PlasmoOld.extensiveSimplifiedModel(P)
+    
+    # Check if the problem has binary variables, and if so, fix
     if hasBin
         fixBinaryVar(Pex_local)
     end
-    Pex_local.solver = IpoptSolver(print_level = 0, max_cpu_time = 600.0)
-    tic()
+    
+    # Look into way to add print level and cpu time
+    JuMP.set_optimizer(Pex_local,Ipopt.Optimizer) #solver = IpoptSolver(print_level = 0, max_cpu_time = 600.0)
+    
+    # Get upper bound and status of first trial
     UB, local_status = multi_start!(Pex_local, UB)
+    
     ### To do, store the whole solution
+    # Status from solver vs model
+    
+    x = zeros(0)
     if local_status == :Optimal
-        x = Pex_local.colVal[1:nfirst]
+    for (idx,var) in enumerate(JuMP.all_variables(Pex_local))
+        if idx>=nfirst
+            break
+        end
+        push!(x,JuMP.value(var))
+    end
         updateStoSolFromExtensive!(Pex_local, P)
     end
+    
     println("U:   ", UB)
     Pex_local = nothing
-
-    # solve with Ipopt_Solve
-    if local_status != :Optimal
-        P_local = copyStoModel(P)
-        if hasBin
-            fixBinaryVar(P_local)
-        end
-        local_status = Ipopt_solve(P_local)
-        if local_status == :Optimal
-            objVal = getsumobjectivevalue(P_local)
-            if UB > objVal
-                UB = objVal
-                x = copy(P.colVal)
-                updateStoSolFromSto!(P_local, P)
-            end
-        end
-    P_local = nothing
-    end
-    local_UB_time_total += toq()
+    local_UB_time_total += time_ns()
     println("U:   ", UB)
 
 ####  preprocess master-children form ##############################################
-    if debug
-        tic()
-    end
+    start_time = time_ns()
     pr_children = preprocessSto!(P)
     if debug
-        println("preprocess:   ",  toq(), " (s)")
+        println("preprocess:   ",  (time_ns()-start_time)/(10^9), " (s)")
     end
 
-
 ##### create and solve extensive form after preprocess #######################################################
-    tic()
-    Pex = extensiveSimplifiedModel(P)
-    Pex_probing = copyModel(Pex)
-    println("extensive:   ",  toq(), " (s)")
+    start_time = time_ns()
+    Pex = PlasmoOld.extensiveSimplifiedModel(m)
+    Pex_probing = PlasmoOld.copyNet(Pex)
+    println("extensive:   ",  (time_ns()-start_time)/(10^9), " (s)")
     #println(Pex)
 
-    tic()
+    start_time = time_ns()
     prex = preprocessex!(Pex)
-    println("preprocessex:   ",  toq(), " (s)")
+    println("preprocessex:   ",  (time_ns()-start_time)/(10^9), " (s)")
 
     if hasBin
-        Pex_local = copyModel(Pex)
+        Pex_local = PlasmoOld.copyNet(Pex)
         fixBinaryVar(Pex_local)
-    Pex_local.solver = IpoptSolver(max_cpu_time = 600.0)
-    local_status = solve(Pex_local)
-    if local_status == :Optimal && UB > Pex.objVal
+        Pex_local.solver = IpoptSolver(max_cpu_time = 600.0)
+        local_status = solve(Pex_local)
+        if local_status == :Optimal && UB > Pex.objVal
             Pex.colVal = copy(Pex_local.colVal)
             Pex.objVal = Pex_local.objVal
-        UB = Pex.objVal
-        updateStoSolFromExtensive!(Pex, P)
+            UB = Pex.objVal
+            updateStoSolFromExtensive!(Pex, P)
         end
     else
         Pex.solver = IpoptSolver(max_cpu_time = 600.0)

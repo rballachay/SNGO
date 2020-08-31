@@ -22,54 +22,101 @@ const debug = true
 #const hasBin = false
 
 using Distributions, SparseArrays, LinearAlgebra
+include("PlasmoOld/src/PlasmoOld.jl")
 
 function multi_start!(P, UB, n_trial = 3)
       updated = false
-      #lb = P.colLower
-      #ub = P.colUpper
-      local_x = copy(collect(values(P.variable_values)))
+      lb = []
+      ub = []
+      local_x = []
+      
+      # Get start value, upper bounds and lower bounds
+      for var in all_variables(P)
+        if JuMP.has_upper_bound(var)
+            push!(ub,JuMP.upper_bound(var))
+        end
+        if JuMP.has_lower_bound(var)
+            push!(lb,JuMP.lower_bound(var))
+        end
+        try
+            push!(local_x,JuMP.value(var))
+        catch e
+            continue
+        end
+      end
+      
       P.ext[:solver] = Ipopt.Optimizer
-      ncols = num_variables(P.model)
+      ncols = num_variables(P)
       mlb = -1e3*ones(ncols)
       mub =  1e3*ones(ncols)
       
-      for i in collect(values(P.constraint_dual_values))
-        print(i)
-          if lb[i] != -Inf
-             mlb[i] = lb[i]
-          end
-          if ub[i] != Inf
-             mub[i] = ub[i]
-	       end
-      end
-      
-      for local_trial = 1:n_trial
-	  if local_trial !=  1
-	      percent = rand(ncols)
-              initial  = mlb + (mub-mlb).*percent
-              print(P.variable_values)
-        for (i,key) in enumerate(keys(P.variable_values))
-              P.variable_values[key] = initial[i]
-        end
-      end
-          prime_status_trial =JuMP.optimize!(P,P.ext[:solver])
-	 # println("prime_status_trial   ",prime_status_trial, "    ", JuMP.objective_value(P.model))
-          if prime_status_trial == :Optimal
-              local_obj_trial = JuMP.objective_value(P.model)
-              if local_obj_trial - UB < - mingap/10
-                  UB = local_obj_trial
-                  updated = true 
-                  local_x = collect(values(P.variable_values))
+      duals = []
+      constraint_types = JuMP.list_of_constraint_types(P)
+      for (func,set) in constraint_types
+          constraint_refs = JuMP.all_constraints(P, func, set)
+          for constraint_ref in constraint_refs
+              constraint = JuMP.constraint_object(constraint_ref)
+              if JuMP.has_duals(P)
+                append!(duals,JuMP.dual(constraint))
               end
           end
       end
+
+      for i in duals
+        if lb[i] != -Inf
+            mlb[i] = lb[i]
+        end
+        if ub[i] != Inf
+            mub[i] = ub[i]
+        end
+      end
+      
+      for local_trial = 1:n_trial
+          if local_trial !=  1
+            percent = rand(ncols)
+            initial  = mlb + (mub-mlb).*percent
+            variables = all_variables(P)
+            for (i,var) in enumerate(JuMP.all_variables(P))
+                JuMP.set_start_value(var,initial[i])
+            end
+          end
+
+          set_optimizer(P,P.ext[:solver])
+          prime_status_trial = false
+         
+         try
+            JuMP.optimize!(P)
+            prime_status_trial = true
+         catch e
+            prime_status_trial = exception
+         end
+         
+         println("prime_status_trial   ",prime_status_trial, "    ", JuMP.objective_value(P))
+         if prime_status_trial
+            local_obj_trial = JuMP.objective_value(P)
+            if local_obj_trial - UB < - mingap/10
+                UB = local_obj_trial
+                updated = true
+                local_x = []
+                for var in all_variables(P)
+                    push!(local_x,JuMP.value(var))
+                end
+            end
+          end
+      end
+      
       println("updated   ", updated, "   ", UB)
       local_status = :UnOptimal
+      
       if updated
       	  local_status = :Optimal
       end
-      P.variable_values = copy(local_x)
-      P.objVal = UB
+      
+      for (i,var) in enumerate(all_variables(P))
+           JuMP.set_start_value(var,local_x[i])
+      end
+
+      # Can't set objective value unless its a variable reference. Don't know how to assign.
       return (UB, local_status)
 end
 
@@ -126,7 +173,7 @@ mutable struct PreprocessResult
      powerVariable_list
      monomialVariable_list 
 end
-PreprocessResult() = PreprocessResult(Int[], LinearConstraint[], [], [], [], [], [], [], [], [])
+PreprocessResult() = PreprocessResult(Int[], GenericAffExpr{Float64,VariableRef}[], [], [], [], [], [], [], [], [])
 
 
 
@@ -291,17 +338,17 @@ end
 
 
 function updateStoFirstBounds!(P)
-    n = P.numCols	 
-    for (idx,scenario) in enumerate(PlasmoOld.getchildren(P))
-        firstVarsId = scenario.ext[:firstVarsId]
-        for i in 1:n
-	    secondId = firstVarsId[i] # the Id of second stage variable corresponds to first stage Id
-            if secondId > 0			       		         
+    n = length(JuMP.all_variables(P))
+    #for (idx,scenario) in enumerate(PlasmoOld.getchildren(P))
+        #for i in 1:n
+	    #secondId = firstVarsId[i] # the Id of second stage variable corresponds to first stage Id
+            #if secondId > 0
+            """
 	        if hasBin
-                    if scenario.colCat[secondId] == :Bin
-                        if scenario.colLower[secondId] == 0.0 && scenario.colUpper[secondId] == 1.0
-                            if P.colCat[i] == :Cont 
-                                P.colCat[i] = :Bin
+                if scenario.colCat[secondId] == :Bin
+                    if scenario.colLower[secondId] == 0.0 && scenario.colUpper[secondId] == 1.0
+                        if P.colCat[i] == :Cont
+                            P.colCat[i] = :Bin
 				if P.colLower[i] < 0.0
 				    P.colLower[i] = 0.0
 				end
@@ -327,23 +374,24 @@ function updateStoFirstBounds!(P)
                 if scenario.colUpper[secondId] <  P.colUpper[i]
                     P.colUpper[i] = scenario.colUpper[secondId]
                 end
-            end
-        end
+            """
+            #end
+        #end
+    #end
+    
+    colLower = []
+    colUpper = []
+    
+    for var in JuMP.all_variables(P)
+        push!(colLower,JuMP.lower_bound(var))
+        push!(colUpper,JuMP.upper_bound(var))
     end
-    if hasBin
-        updateFirstBounds!(P, P.colLower, P.colUpper, P.colCat)
-    else
-        updateFirstBounds!(P, P.colLower, P.colUpper)
-    end
+    #updateFirstBounds!(P, colLower, colUpper)
+    
 end
 
 # update bounds and cat information in the first stage variables of the master-scenario form
 function updateFirstBounds!(P, xl::Array{Float64,1}, xu::Array{Float64,1}, cat=nothing)
-        P.colLower = copy(xl)
-        P.colUpper = copy(xu)
-	if cat != nothing
-	    P.colCat = copy(cat)
-	end
 
 	n = P.numCols
         if hasBin
@@ -357,13 +405,7 @@ function updateFirstBounds!(P, xl::Array{Float64,1}, xu::Array{Float64,1}, cat=n
 		end	
 	    end
 	end
-	#=
-	for i = 1:n
-	    if xl[i] == xu[i]  
-	       	fixVar(Variable(P, i), xl[i])     
-	    end   
-	end
-	=#
+
         for (idx,scenario) in enumerate(PlasmoOld.getchildren(P))	
 	    for i = 1:n
 	    	secondId = scenario.ext[:firstVarsId][i] # the Id of second stage variable corresponds to first stage Id
@@ -570,13 +612,31 @@ end
 
 
 function updateStoSolFromExtensive!(Pex, P)
-        nfirst = P.numCols
-        P.colVal = copy(Pex.colVal[1:nfirst])
+        # Get number of first stage variables
+        nfirst=num_variables(P)
+        varRefs = JuMP.all_variables(P)
+        
+        # Copy over all the variables as start values for
+        # the stochastic solution after solving the extensive
+        # form of the problem
+        for (idx,var) in enumerate(JuMP.all_variables(Pex))
+            if idx>=nfirst
+                break
+            end
+            value = JuMP.value(var)
+            JuMP.set_start_value(varRefs[idx],value)
+        end
+        
+        # Copy over the solutions from the extensive problem
+        # to the child models in stochastic form
         for (idx,scenario) in enumerate(PlasmoOld.getchildren(P))
-            v_map = Pex.ext[:v_map][idx]
-            scenario.colVal = copy(Pex.colVal[v_map])
-            if in("objective_value", scenario.colNames)   
-               scenario.objVal = getvalue(scenario[:objective_value])
+            varRefs = JuMP.all_variables(scenario)
+            for (idx,var) in enumerate(varRefs)
+            # Use the extensive variable map to get the original
+            # variables refs back from the model
+                ext_var = Pex.ext[:v_map][var]
+                value = JuMP.value(ext_var)
+                JuMP.set_start_value(var,value)
             end
         end
 end
@@ -618,11 +678,14 @@ function inBounds(m::JuMP.Model, sol)
         sum(m.colLower.<=sol.<=m.colUpper) == length(sol)
 end
 
+function eval_g(c::VariableRef, x)
+    return x[c.index.value]
+end
 
 function eval_g(c::AffExpr, x)
     sum = c.constant
-    for i in 1:length(c.vars)
-        sum += c.coeffs[i] * x[c.vars[i].col]
+    for (var,coef) in c.terms
+        sum += coef * x[var.index.value]
     end
     return sum
 end
@@ -682,28 +745,81 @@ function projection!(sol, xl, xu)
     end
 end
 
-
+# I don't see how this function is any different from copy
 function factorable!(P)
+    # Create new model and variable map dictionaries
     m = Model()
-    m.solver = P.solver  
+    m.ext[:v_map] = Dict{VariableRef,VariableRef}()
+    P.ext[:v_map] = Dict{VariableRef,VariableRef}()
+    boundMap = Dict{VariableRef,VariableRef}()
+    
+    # Copy the optimizer and attributes to new model
+    m.moi_backend = P.moi_backend
+    
     # Variables
-    m.numCols = P.numCols
-    m.colNames = P.colNames[:]
-    m.colNamesIJulia = P.colNamesIJulia[:]
-    m.colLower = P.colLower[:]
-    m.colUpper = P.colUpper[:]
-    m.colCat = P.colCat[:]
-    m.colVal = P.colVal[:]
-
-    # Constraints
-    m.linconstr  = map(c->copy(c, m), P.linconstr)
-    m.quadconstr = map(c->copy(c, m), P.quadconstr)
-
+    vars = JuMP.all_variables(P)
+    
+    # Add the variables without start value and bounds
+    allVars_preCon = JuMP.all_variables(P)
+    for var in allVars_preCon
+       new_x = JuMP.@variable(m)            #create an anonymous variable
+       new_name = JuMP.name(var)
+       JuMP.set_name(new_x,new_name)
+       push!(m.ext[:v_map], var => new_x)
+       push!(P.ext[:v_map], var => new_x)
+    end
+    
+    # Copy over all the constraints
+    constraint_types = JuMP.list_of_constraint_types(P)
+     for (func,set) in constraint_types
+           # Variable bounds are stored as constraints, leads to resestting
+           #of bounds, so exclude as constraint
+           if func==VariableRef
+                continue
+           end
+           
+           constraint_refs = JuMP.all_constraints(P, func, set)
+           for constraint_ref in constraint_refs
+               constraint = JuMP.constraint_object(constraint_ref)
+               new_constraint = PlasmoOld._copy_constraint(constraint,P)
+               if new_constraint.func isa VariableRef
+                    push!(m.ext[:v_map], constraint.func => new_constraint.func)
+               else
+                    squeeze!(new_constraint.func)
+               end
+               new_ref= JuMP.add_constraint(m,new_constraint)
+           end
+       end
+    
+    # Add variable bounds where none are present
+    for var in allVars_preCon
+       if JuMP.start_value(var) != nothing
+           JuMP.set_start_value(m.ext[:v_map][var],JuMP.start_value(var))
+       end
+       if JuMP.has_lower_bound(var)
+            JuMP.set_lower_bound(m.ext[:v_map][var],lower_bound(var))
+       else
+            JuMP.set_lower_bound(m.ext[:v_map][var],default_lower_bound_value)
+       end
+       if JuMP.has_upper_bound(var)
+            JuMP.set_upper_bound(m.ext[:v_map][var],upper_bound(var))
+       else
+            JuMP.set_lower_bound(m.ext[:v_map][var],default_upper_bound_value)
+       end
+    end
+    
     # Objective
-    m.obj = copy(P.obj, m)
-    m.objSense = P.objSense
-
-
+    if !(PlasmoOld._has_nonlinear_obj(P))
+        #AFFINE OR QUADTRATIC OBJECTIVE
+        new_objective = PlasmoOld._copy_objective(P,m.ext[:v_map])
+        objSense = objective_sense(P)
+        set_objective_function(m,new_objective)
+        set_objective_sense(m,objSense)
+    else
+        #NONLINEAR OBJECTIVE
+        print("sorry, currently not support nonlinear objective function, please formulate it as a constraint!")
+    end
+    
     if !isempty(P.ext)
         m.ext = empty(P.ext)
         for (key, val) in P.ext
@@ -715,7 +831,8 @@ function factorable!(P)
         end
     end
  
-    if P.nlpdata != nothing
+    # Copy over nlp constraints if they exist
+    if P.nlp_data != nothing
         d = JuMP.NLPEvaluator(P)         #Get the NLP evaluator object.  Initialize the expression graph
         MathProgBase.initialize(d,[:ExprGraph])
         num_cons = MathProgBase.numconstr(P)
@@ -724,16 +841,6 @@ function factorable!(P)
             _modifycon!(m, expr)                  #splice the variables from v_map into the expression
         end
     end
-    #=
-    R2 = PlasmoOld.copyModel(m)
-    d = JuMP.NLPEvaluator(R2)
-    MathProgBase.initialize(d,[:ExprGraph])
-    num_cons = MathProgBase.numconstr(R2)
-    for i = 1:num_cons
-            expr = MathProgBase.constr_expr(d,i)  #this returns a julia expression
-            println(expr)
-    end
-    =#
     return m
 end
 
@@ -1905,10 +2012,10 @@ end
 
 
 function hasBinaryVar(m::JuMP.Model)
-    for i = 1:m.numCols
-        if m.colCat[i] == :Bin
+    for i in JuMP.all_variables(m)
+        if JuMP.is_binary(i)
             return true
-    end
+        end
     end
     return false
 end
@@ -1916,8 +2023,8 @@ end
 
 function numBinaryVar(m::JuMP.Model)
     n = 0
-    for i = 1:m.numCols
-        if m.colCat[i] == :Bin
+    for i in JuMP.all_variables(m)
+        if JuMP.is_binary(i)
             n = n + 1
         end
     end

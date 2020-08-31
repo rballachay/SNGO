@@ -3,75 +3,55 @@ using Distributions, SparseArrays, LinearAlgebra
 function preprocessSto!(P)
     scenarios = PlasmoOld.getchildren(P)	 
     # provide initial value if not defined
-    for i in 1:length(P.colVal)
-        if isnan(P.colVal[i])
-           P.colVal[i] = 0
-        end
-    end
-
-    # find index of first stage variables in each scenario. Linking constraints is stored in the master node. Each linking constraint involves 1 variable from master node and 1 varibale from a scenario node.
-    ncols_first = P.numCols
-    for (idx,scenario) in enumerate(scenarios)    
-    	scenario.ext[:firstVarsId] .= zeros(Int, ncols_first)
-	scenario.ext[:firstVarsId][1:end] .= -1
-    end
-    for c in 1:length(P.linconstr)
-        coeffs = P.linconstr[c].terms.coeffs
-        vars   = P.linconstr[c].terms.vars
-	firstVarId = 0
-        for (it,ind) in enumerate(coeffs)
-            if (vars[it].m) == P
-	        firstVarId = vars[it].col
-		break
-            end
-        end
-        for (it,ind) in enumerate(coeffs)
-            if (vars[it].m) != P
-               scenario = vars[it].m
-	       scenario.ext[:firstVarsId][firstVarId] = vars[it].col 
-            end
+    vars = JuMP.all_variables(P)
+    for (idx,var) in enumerate(vars)
+        if isnothing(start_value(var))
+           JuMP.set_start_value(var,0)
         end
     end
 
     # provide bounds if not defined
-    ncols =  P.numCols
-    for i in 1:ncols
-        if P.colLower[i] == -Inf
-            P.colLower[i] = default_lower_bound_value
+    for var in vars
+        if !JuMP.has_lower_bound(var)
+            JuMP.set_lower_bound(var,default_lower_bound_value)
         end
-        if P.colUpper[i] == Inf
-            P.colUpper[i] = default_upper_bound_value
+        if !JuMP.has_upper_bound(var)
+             JuMP.set_upper_bound(var,default_upper_bound_value)
         end
     end
+    
     for (idx,scenario) in enumerate(scenarios)
-    	for i in 1:scenario.numCols
-            if scenario.colLower[i] == -Inf
-                scenario.colLower[i] = default_lower_bound_value
+    scenVars = JuMP.all_variables(scenario)
+    	for var in scenVars
+            if !JuMP.has_lower_bound(var)
+                JuMP.set_lower_bound(var,default_lower_bound_value)
             end
-            if scenario.colUpper[i] == Inf
-                scenario.colUpper[i] = default_upper_bound_value
+            if !JuMP.has_upper_bound(var)
+                JuMP.set_upper_bound(var,default_upper_bound_value)
             end
     	end
 	if debug
-	    println("first:  ", scenario.ext[:firstVarsId])
+	    println("debug")
 	end    
     end
+    # For binary variables. Need to check what this is for.
     updateStoFirstBounds!(P)    
 
 
     nscen = length(scenarios)
     pr_children = []
     for (idx,scen) in enumerate(scenarios)
-        #println("scen: ",scen)
         pr, scenarios[idx] = preprocess!(scen)
         push!(pr_children, pr)
-
-        for i = 1:length(P.linconstr)
-            Pcon = P.linconstr[i]
+        linConstr1 = JuMP.all_constraints(P,GenericAffExpr{Float64,VariableRef},MathOptInterface.EqualTo{Float64})
+        linConstr2 = JuMP.all_constraints(P,GenericAffExpr{Float64,VariableRef},MathOptInterface.LessThan{Float64})
+        linConstr3 = JuMP.all_constraints(P,GenericAffExpr{Float64,VariableRef},MathOptInterface.GreaterThan{Float64})
+        linConstr = [linConstr1;linConstr2;linConstr3]
+        for constr in linConstr
             Pvars = Pcon.terms.vars
             for (j, Pvar) in enumerate(Pvars)
-                if (Pvar.m == scen)
-                     Pvars[j] = Variable(scenarios[idx], Pvar.col)
+                if (Pvar.model == scen)
+                     Pvars[j] = VariableRef(scenarios[idx], Pvar.index)
                 end
             end
         end

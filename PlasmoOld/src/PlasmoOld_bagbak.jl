@@ -3,83 +3,47 @@
 # UW-Madison, 2016
 # objective cannot be nonlinear    (can be quadratic)
 
+
 module PlasmoOld
 using JuMP
-import DataStructures.OrderedDict
 export NetModel, @addNode, getNode, @Linkingconstraint
 export getparent, getchildren, getchildrenDict
 export Ipopt_solve
 export PipsNlp_solve
-export getsumobjectivevalue, RandomStochasticModel, StochasticModel, copyStoModel, copyModel, copyNLModel, extensiveSimplifiedModel, addNLconstraint2, getData, _splicevars!, copyNet, NetModel
+export getsumobjectivevalue, RandomStochasticModel, StochasticModel, copyStoModel, copyModel, copyNLModel, extensiveSimplifiedModel, addNLconstraint2, getData, _splicevars!
 using Base.Meta
 using MathProgBase
 using Distributions
 
-#Check for nonlinear objective
-function _has_nonlinear_obj(m::JuMP.Model)
-    if m.nlp_data != nothing
-        if m.nlp_data.nlobj != nothing
-            return true
-        end
+function copyModel(model::Model)
+    caching_mode = backend(model).mode
+    new_model = Model(caching_mode = caching_mode)
+
+    # Copy the MOI backend, note that variable and constraint indices may have
+    # changed, the `index_map` gives the map between the indices of
+    # `backend(model` and the indices of `backend(new_model)`.
+    index_map = MOI.copy_to(backend(new_model), backend(model),
+                            copy_names = true)
+
+    new_model.optimize_hook = model.optimize_hook
+
+    # TODO copy NLP data
+    if model.nlp_data !== nothing
+        error("copy is not supported yet for models with nonlinear constraints",
+              " and/or nonlinear objective function")
     end
-    return false
-end
 
-# COPY CONSTRAINT FUNCTIONS
-function _copy_constraint_func(func::JuMP.GenericAffExpr,ref_map::Dict{VariableRef,VariableRef})
-    terms = func.terms
-    new_terms = OrderedDict([(ref_map[var_ref],coeff) for (var_ref,coeff) in terms])
-    new_func = JuMP.GenericAffExpr{Float64,JuMP.VariableRef}()
-    new_func.terms = new_terms
-    new_func.constant = func.constant
-    return new_func
-end
+    reference_map = ReferenceMap(new_model, index_map)
 
-function _copy_constraint_func(func::JuMP.GenericQuadExpr,ref_map::Dict{VariableRef,JuMP.VariableRef})
-    new_aff = _copy_constraint_func(func.aff,ref_map)
-    new_terms = OrderedDict([(JuMP.UnorderedPair(ref_map[pair.a],ref_map[pair.b]),coeff) for (pair,coeff) in func.terms])
-    new_func = JuMP.GenericQuadExpr{Float64,JuMP.VariableRef}()
-    new_func.terms = new_terms
-    new_func.aff = new_aff
-    #new_func.constant = func.constant
-    return new_func
-end
+    for (name, value) in object_dictionary(model)
+        new_model.obj_dict[name] = getindex.(reference_map, value)
+    end
 
-function _copy_constraint_func(func::JuMP.VariableRef,ref_map::Dict{VariableRef,VariableRef})
-    new_func = ref_map[func]
-    return new_func
-end
+    for (key, data) in model.ext
+        new_model.ext[key] = data
+    end
 
-function _copy_constraint(constraint::JuMP.ScalarConstraint,m::Model)
-    ref_map = m.ext[:v_map]
-    new_func = _copy_constraint_func(constraint.func,ref_map)
-    new_con = JuMP.ScalarConstraint(new_func,constraint.set)
-    return new_con
-end
-
-function _copy_constraint(constraint::JuMP.VectorConstraint,m::Model)
-    new_funcs = [_copy_constraint_func(func,m.ext[:v_map]) for func in constraint.func]
-    new_con = JuMP.VectorConstraint(new_funcs,constraint.set,constraint.shape)
-    return new_con
-end
-
-function copy_extension_data(data::Array{Any,1},new_model::Model,model::Model)
-    
-end
-
-#COPY OBJECTIVE FUNCTIONS
-function _copy_objective(m::JuMP.Model,ref_map::Dict{VariableRef,VariableRef})
-    return _copy_objective(JuMP.objective_function(m),ref_map)
-end
-
-function _copy_objective(func::Union{JuMP.GenericAffExpr,JuMP.GenericQuadExpr},ref_map::Dict{VariableRef,VariableRef})
-    new_func = _copy_constraint_func(func,ref_map)
-    return new_func
-end
-
-function _copy_objective(func::JuMP.VariableRef,ref_map::Dict{VariableRef,VariableRef})
-    new_func = ref_map[func]
-    return new_func
+    return new_model, reference_map
 end
 
 mutable struct NetData
@@ -93,50 +57,10 @@ NetData() = NetData(JuMP.Model[], nothing, Dict{String, JuMP.Model}())
 function NetModel(buildType="serial")
     m = JuMP.Model()
     m.ext[:Net] = NetData()
-    m.ext[:LinkDict] = Dict{JuMP.VariableRef, JuMP.VariableRef}()
     m.ext[:BuildType] = buildType
     m.ext[:linkingId] = []
     return m
 end
-
-# Copies over a NetModel and makes a reference map.
-# Variable indices don't matter as first stage variables
-# are recognized by name, not by index.
-
-function copyNet(model::Model)
-    caching_mode = backend(model).mode
-    new_model = Model(caching_mode = caching_mode)
-
-    # Copy the MOI backend, note that variable and constraint indices may have
-    # changed, the `index_map` gives the map between the indices of
-    # `backend(model` and the indices of `backend(new_model)`.
-    index_map = MOI.copy_to(backend(new_model), backend(model),copy_names = true)
-    
-    # Hook into a solve call...function of the form f(m::Model; kwargs...),
-    # where kwargs get passed along to subsequent solve calls.
-    new_model.optimize_hook = model.optimize_hook
-
-    # Copy NLP data
-    if model.nlp_data !== nothing
-        error("copy is not supported yet for models with nonlinear constraints and/or nonlinear objective function")
-    end
-
-    # Generate a reference map between indices of old and new variables
-    reference_map = ReferenceMap(new_model, index_map)
-
-    # Copy object dictionary over to new model
-    for (name, value) in object_dictionary(model)
-        new_model.obj_dict[name] = getindex.(reference_map, value)
-    end
-    
-    # Copy extension data over to new model
-    for (key, data) in model.ext
-        new_model.ext[key] = model.ext[key]
-    end
-
-    return new_model
-end
-
 
 function getNet(m::JuMP.Model)
     if haskey(m.ext, :Net)
@@ -448,7 +372,7 @@ end
 #=
 function extensiveModel(P::JuMP.Model)
         m = Model()
-    m.ext[:v_map] = []
+        m.ext[:v_map] = []
         children = getchildren(P)
         nscen = length(children)
         NLobj = false
@@ -514,84 +438,79 @@ function extensiveModel(P::JuMP.Model)
         return m
 end
 =#
+abstract type AbstractLinkConstraint <: JuMP.AbstractConstraint end
+struct LinkConstraint{F <: JuMP.AbstractJuMPScalar,S <: MOI.AbstractScalarSet} <: AbstractLinkConstraint
+    func::F
+    set::S
+end
+
+struct ModelMap
+    combined_model::JuMP.AbstractModel                             #An combined model (Could be another OptiGraph)
+    varmap::Dict{JuMP.VariableRef,JuMP.VariableRef}                 #map variables in original modelgraph to combinedmodel
+    conmap::Dict{JuMP.ConstraintRef,JuMP.ConstraintRef}             #map constraints in original modelgraph to combinedmodel
+    linkconstraintmap::Dict{LinkConstraint,JuMP.ConstraintRef}
+end
+
+ModelMap(m::JuMP.AbstractModel) = ModelMap(m,Dict{JuMP.VariableRef,JuMP.VariableRef}(),Dict{JuMP.ConstraintRef,JuMP.ConstraintRef}(),Dict{LinkConstraintRef,JuMP.ConstraintRef}())
+
+function _set_node_objectives!(modelgraph::JuMP.Model)
+    #check for quadratic objectives
+    all_nodes = getChildren(modelgraph)
+    if any(isa.(objective_function.(all_nodes),Ref(GenericQuadExpr)))
+        graph_obj = zero(JuMP.GenericQuadExpr{Float64, JuMP.VariableRef})
+    else
+        graph_obj = zero(JuMP.GenericAffExpr{Float64, JuMP.VariableRef})
+    end
+
+    #  #testing changing this to quadratic expression
+    for node in all_nodes
+        sense = JuMP.objective_sense(node)
+        s = sense == MOI.MAX_SENSE ? -1.0 : 1.0
+        JuMP.add_to_expression!(graph_obj,s,JuMP.objective_function(node))
+    end
+
+    JuMP.set_objective(modelgraph,MOI.MIN_SENSE,graph_obj)
+end
 
 function extensiveSimplifiedModel(P::JuMP.Model)
-    # Make a new model and add dictionary extensions
-    m = Model()
-    m.ext[:v_map] = Dict{VariableRef,VariableRef}()
-    m.ext[:fstg_n] = Dict{String,VariableRef}()
-    m.ext[:c_map] = Dict{ConstraintRef,ConstraintRef}()
-    NLobj = false
-    children = getchildren(P)
-    nscen = length(children)
-    
-    # Add the node model variables to the new model. All first
-    # stage variables are stored by name. If there is a second stage
-    # variable which has the same name as a first stage variable, it
-    # will be replaced by the single first stage copy.
-    for var in JuMP.all_variables(P)
-        new_x = JuMP.@variable(m)            #create an anonymous variable
-        push!(m.ext[:v_map], var => new_x)
-        var_name = JuMP.name(var)
-        push!(m.ext[:fstg_n],var_name=>new_x)
-        new_name = var_name
-        JuMP.set_name(new_x,new_name)
-        if JuMP.start_value(var) != nothing
-            JuMP.set_start_value(new_x,JuMP.start_value(var))
-        end
-     end
+  combined_model = Model()
+  reference_map = ModelMap(combined_model)
 
-    #OBJECTIVE FUNCTION (store expression on combinedd_nodes)
-    if !(_has_nonlinear_obj(P))
-        #AFFINE OR QUADTRATIC OBJECTIVE
-        new_objective = _copy_objective(P,m.ext[:v_map])
-        objSense = objective_sense(P)
-        set_objective_function(m,new_objective)
-        set_objective_sense(m,objSense)
-    else
-        #NONLINEAR OBJECTIVE
-        print("sorry, currently not support nonlinear objective function, please formulate it as a constraint!")
+  #COPY NODE MODELS INTO Combined MODEL
+  has_nonlinear_objective = false                      #check if any nodes have nonlinear objectives
+  for modelnode in all_nodes(modelgraph)               #for each node in the model graph
+      node_model = getmodel(modelnode)
+      #Need to pass master reference so we use those variables instead of creating new ones
+      node_ref_map = _add_to_combined_model!(combined_model,node_model,reference_map)  #updates combined_model and reference_map
+
+      #Check for nonlinear objective functions unless we know we already have one
+      if has_nonlinear_objective != true
+          has_nonlinear_objective = _has_nonlinear_obj(node_model)
     end
-    
-    # Get bunch of reference values to store in the extensive model
-    children = getchildren(P)
-    nscen = length(children)
-    ncols = Array{Int}(undef,nscen+1)
-    nlinconstrs = Array{Int}(undef,nscen+1)
-    ncols[1] = num_variables(P)
-    
-    # Copy over the objective function from the master model.
-    # Linearly combine objectives of master and node models
-    masterObj = JuMP.objective_function(P)
-    masterObjTerms = masterObj.terms
-    objConst = masterObj.constant
-    
-    # Iterate over the scenario models and add to the extensive
-    # form of the model.
-    for scen in 1:nscen
-        node = children[scen]
-        modelname = "s$(scen)"
-        nodeobj = addnodeSimplifiedmodel!(m, node, modelname, scen)
-        
-        # If the objective is a variable reference, create dictionary
-        # with coefficient and variableref
-        if nodeobj isa JuMP.VariableRef
-            dict = OrderedDict{JuMP.VariableRef,Int64}()
-            push!(dict,nodeobj => 1)
-            merge!(masterObjTerms,dict)
-        else
-            objTerms = nodeobj.terms
-            print(typeof(objTerms))
-            objConst += nodeobj.constant
-            merge!(masterObjTerms,nodeobj.terms)
-        end
     end
-    kv = masterObjTerms
-    newObj = GenericAffExpr(objConst,kv)
-    set_objective_function(m,newObj)
-    set_objective_sense(m,MOI.MIN_SENSE)
-    m.ext[:ncols] = ncols
-    m.ext[:nlinconstrs] = nlinconstrs
+
+  #OBJECTIVE FUNCTION
+  if !(has_objective(modelgraph)) && !has_nonlinear_objective
+      _set_node_objectives!(modelgraph)  #set modelgraph objective function
+  _set_node_objectives!(modelgraph,combined_model,reference_map,has_nonlinear_objective) #set combined_model objective function
+  end
+
+  if has_objective(modelgraph)
+      agg_graph_obj = _copy_constraint_func(JuMP.objective_function(modelgraph),reference_map)
+      JuMP.set_objective_function(combined_model,agg_graph_obj)
+      JuMP.set_objective_sense(combined_model,JuMP.objective_sense(modelgraph))
+  end
+
+  #ADD LINK CONSTRAINTS
+  for linkconstraint in all_linkconstraints(modelgraph)
+      new_constraint = _copy_constraint(linkconstraint,reference_map)
+      cref = JuMP.add_constraint(combined_model,new_constraint)
+      reference_map.linkconstraintmap[linkconstraint] = cref
+  end
+
+  modelnode = OptiNode()
+  set_model(modelnode,combined_model)
+  return modelnode,reference_map
     return m
 end
 
@@ -599,80 +518,73 @@ end
 function addnodeSimplifiedmodel!(m::JuMP.Model,node::JuMP.Model, nodename, scen)
         old_numCols = num_variables(m)
         num_vars = num_variables(node)
-        constraint_types = JuMP.list_of_constraint_types(node)
-        
+        firstVarsId = node.ext[:firstVarsId]
         v_map = Array{Int}(undef,num_vars)        #this dict will map linear index of the node model variables to the new model JuMP variables {index => JuMP.VariableRef}
         #add the node model variables to the new model
-        for (idx,var) in enumerate(JuMP.all_variables(node))
-            fVarr = findall(x->x==name(var),collect(keys(m.ext[:fstg_n])))
-            if length(fVarr) == 0
-                new_x = JuMP.@variable(m)            #create an anonymous variable
-                push!(m.ext[:v_map], var => new_x)
-                var_name = JuMP.name(var)
-                new_name = var_name*nodename
-                JuMP.set_name(new_x,new_name)
-                if JuMP.start_value(var) != nothing
-                    JuMP.set_start_value(new_x,JuMP.start_value(var))
-                end
-            else
-                fStgVar = m.ext[:fstg_n][name(var)]
-                push!(m.ext[:v_map], var => fStgVar)
-            end
+        for i = 1:num_vars
+        fVarr = findall(x->x==i,firstVarsId)
+        allVars = all_variables(m)
+        if length(fVarr) == 0
+                x = JuMP.@variable(m)            #create an anonymous variable
+                upperBound = upper_bound(allVars[i])
+                lowerBound = lower_bound(allVars[i])
+                set_lower_bound(x, lowerBound)
+                setupper_bound(x, upperBound)
+                var_name = name(allVars[i])
+                set_name(x,nodename*var_name)    #rename the variable to the node model variable name plus the node or edge name
+                #m.colCat[x.col] = node.colCat[i]
+                #setcategory(x, node.colCat[i])                            #set the variable to the same category
+                setvalue(x,node.colVal[i])                                #set the variable to the same value
+                #v_map[i] = x.col                                              #map the linear index of the node model variable to the new variable
+        else
+        v_map[i] = first[1]
         end
-           
-        for (func,set) in constraint_types
-            constraint_refs = JuMP.all_constraints(node, func, set)
-            for constraint_ref in constraint_refs
-                constraint = JuMP.constraint_object(constraint_ref)
-                new_constraint = _copy_constraint(constraint,m)
-                if typeof(constraint.func) == VariableRef
-                    continue
-                elseif typeof(constraint.func) == GenericAffExpr{Float64,VariableRef}
-                    vars = [name(var) for var in collect(keys(constraint.func.terms))]
-                elseif typeof(constraint.func) == GenericQuadExpr{Float64,VariableRef}
-                    varsa = [name(var.a) for var in collect(keys(constraint.func.terms))]
-                    varsb = [name(var.b) for var in collect(keys(constraint.func.terms))]
-                    vars=[varsa;varsb]
-                else
-                    print(typeof(constraint.func))
-                end
-                # if it is a first stage constraints (a constraints has only only first stage variables)
-                #print(length(findall(x->x in vars,collect(keys(m.ext[:fstg_n])))))
-                if length(findall(x->x in vars,collect(keys(m.ext[:fstg_n])))) == length(vars) && scen != 1
-                    print("First stg constraint\n")
-                    continue
-                end
-                new_ref= JuMP.add_constraint(m,new_constraint)
-                #push!(m.ext[:c_map], [constraint_ref] => new_ref[1])
+        end
+    push!(m.ext[:v_map], v_map)
+
+        for i = 1:length(node.linconstr)
+        con = copy(node.linconstr[i], node)
+        varsId = extractVarsId(con.terms.vars)
+        # if it is a first stage constraints (a constraints has only only first stage variables)
+        if length(findin(varsId, firstVarsId))  == length(varsId) && scen != 1
+            continue
+        end
+        con.terms.vars = copy(con.terms.vars, m, v_map)
+        m.linconstr = [m.linconstr; con]
+        end
+
+        for i = 1:length(node.quadconstr)
+            con = copy(node.quadconstr[i], node)
+            terms = con.terms
+            varsId = extractVarsId([terms.qvars1;terms.qvars2;terms.aff.vars])
+            if length(findin(varsId, firstVarsId))  == length(varsId) && scen    != 1
+                continue
             end
+            terms.qvars1 = copy(terms.qvars1, m, v_map)
+            terms.qvars2 = copy(terms.qvars2, m, v_map)
+            terms.aff.vars = copy(terms.aff.vars, m, v_map)
+            m.quadconstr = [m.quadconstr; con]
         end
 
         #Copy the non-linear constraints to the new model
-        nlp_initialized = false
-        if node.nlp_data !== nothing
-            d = JuMP.NLPEvaluator(node)         #Get the NLP evaluator object.  Initialize the expression graph
-            MOI.initialize(d,[:ExprGraph])
-            nlp_initialized = true
-            num_cons = MathProgBase.numconstr(node)
-            
-            for i = 1:length(node_model.nlp_data.nlconstr)
-                expr = MOI.constraint_expr(d,i)                         #this returns a julia expression
-                if !(MathProgBase.isconstrlinear(d,i))    #if it's not a linear constraint
-                    expr = MOI.constr_expr(d,i)  #this returns a julia expression
-                    _splice_nonlinear_variables!(expr,node_model,reference_map)        #splice the variables from var_map into the expression
-                    varsId = extractVarsId(expr)
-                    if length(findall(x->x==varsId, firstVarsId))  == length(varsId) && scen != 1
-                        continue
-                    end
-                    constraint_ref = JuMP.ConstraintRef(node,JuMP.NonlinearConstraintIndex(i),new_nl_constraint.shape)
-                    reference_map[constraint_ref] = new_nl_constraint
-                    _splice_nonlinear_variables!(expr,node,reference_map)        #splice the variables from var_map into the expression
-                    new_nl_constraint = JuMP.add_NL_constraint(m,expr)      #raw expression input for non-linear constraint
+        d = JuMP.NLPEvaluator(node)         #Get the NLP evaluator object.  Initialize the expression graph
+        MathProgBase.initialize(d,[:ExprGraph])
+        num_cons = MathProgBase.numconstr(node)
+        for i = (1+length(node.linconstr)+length(node.quadconstr)):num_cons
+            if !(MathProgBase.isconstrlinear(d,i))    #if it's not a linear constraint
+                expr = MathProgBase.constr_expr(d,i)  #this returns a julia expression
+                varsId = extractVarsId(expr)
+                if length(findin(varsId, firstVarsId))  == length(varsId) && scen != 1
+                    continue
                 end
+                _splicevars!(expr, m, v_map)              #splice the variables from v_map into the expression
+                addNLconstraint2(m,expr)                #raw expression input for non-linear constraint
             end
         end
-        
-        nodeobj = _copy_objective(node,m.ext[:v_map])
+        nodeobj = copy(node.obj)
+        nodeobj.qvars1 = copy(nodeobj.qvars1, m, v_map)
+        nodeobj.qvars2 = copy(nodeobj.qvars2, m, v_map)
+        nodeobj.aff.vars = copy(nodeobj.aff.vars, m, v_map)
         return nodeobj
 end
 
@@ -858,19 +770,12 @@ end
 function extractVarsId(vars::Array{VariableRef,1})
     varsId = Int[]
     for i = 1:length(vars)
-        push!(varsId, vars[i].index.value)
+        push!(varsId, vars[i].col)
     end
     return union(varsId)
 end
 
-function extractVarsId(vars::Array{UnorderedPair{VariableRef},1})
-    varsId = Int[]
-    for i = 1:length(vars)
-        push!(varsId, vars[i].a.index.value)
-        push!(varsId, vars[i].b.index.value)
-    end
-    return union(varsId)
-end
+
 
 
 function removeConnection(master::JuMP.Model)
@@ -923,7 +828,11 @@ function addNLconstraint2(m::Model, ex::Expr)
         return ConstraintRef{Model,NonlinearConstraint}(m, length(m.nlpdata.nlconstr))
 end
 
+
 end
+eval(x) = Core.eval(@__MODULE__, x)
+include(x) = Base.include(@__MODULE__, x)
+include("combine.jl")
 #include("NetParPipsNlp.jl")
 #include("NetIpopt.jl")
 #end
